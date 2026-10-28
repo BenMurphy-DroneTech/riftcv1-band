@@ -506,6 +506,11 @@ void esb_write(uint8_t *data)
 	tx_payload.noack = false;
 #endif
 	memcpy(tx_payload.data, data, tx_payload.length);
+	// The connection thread writes some packets back to back: give the last one time for its
+	// retries (3 at 600 us, a beacon slot can cost one) before flushing it
+	int64_t wait_until = k_uptime_get() + 3;
+	while (!esb_is_idle() && k_uptime_get() < wait_until)
+		k_usleep(50);
 	if (!esb_is_idle())
 		stats_flushed++;
 	esb_flush_tx(); // this will clear all transmissions even if they did not complete

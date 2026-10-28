@@ -182,6 +182,7 @@ void rift_ts_print(void)
 	printk(" over %u ms: rate %c%u.%03u ppm, residuals rms %d ns, max %d ns\n", span_ms,
 	       ppb < 0 ? '-' : '+', (uint32_t)(ppb_abs / 1000), (uint32_t)(ppb_abs % 1000),
 	       ns(sqrt(ss / n)), ns(worst));
+	k_msleep(5);
 	printk("  band (us)            beacon frame + offset (us)   residual\n");
 	for (uint32_t i = 0; i < n; i++) {
 		double r = (double)(f[i].beacon - f[0].beacon) - my -
@@ -191,5 +192,6 @@ void rift_ts_print(void)
 
 		printk("  %llu.%04u  %llu + %u.%04u  %+d ns\n", f[i].band / 16,
 		       (uint32_t)(f[i].band % 16) * 625, frame, off / 16, (off % 16) * 625, ns(r));
+		k_msleep(5); /* printk goes through the 1.5 kB log buffer: let it drain */
 	}
 }
