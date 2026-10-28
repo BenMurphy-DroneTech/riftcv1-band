@@ -4,6 +4,7 @@
 #include "sensor/sensor.h"
 #include "sensor/calibration.h"
 #include "connection/esb.h"
+#include "connection/rift_ts.h"
 #include "build_defines.h"
 #include "parse_args.h"
 
@@ -491,6 +492,7 @@ static void print_help(void)
 	printk("reboot                       Soft reset the device\n");
 	printk("battery                      Get battery information\n");
 	printk("stats                        Get radio packet counts since the last stats\n");
+	printk("pairs                        Timestamp pairs from the receiver and their line fit\n");
 	printk("\nscan                         Restart sensor scan\n");
 	printk("calibrate                    Calibrate sensor ZRO\n");
 	printk("6-side                       Calibrate 6-side accelerometer\n");
@@ -549,6 +551,7 @@ static void console_thread(void)
 	const char command_reboot[] = "reboot";
 	const char command_battery[] = "battery";
 	const char command_stats[] = "stats";
+	const char command_pairs[] = "pairs";
 	const char command_scan[] = "scan";
 	const char command_calibrate[] = "calibrate";
 	const char command_6_side[] = "6-side";
@@ -625,6 +628,10 @@ static void console_thread(void)
 		else if (strcmp(argv[0], command_stats) == 0)
 		{
 			esb_print_stats();
+		}
+		else if (strcmp(argv[0], command_pairs) == 0)
+		{
+			rift_ts_print();
 		}
 		else if (strcmp(argv[0], command_scan) == 0)
 		{

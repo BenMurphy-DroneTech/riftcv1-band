@@ -31,6 +31,7 @@
 #include <zephyr/sys/crc.h>
 
 #include "esb.h"
+#include "rift_ts.h"
 
 uint8_t last_reset = 0;
 //const nrfx_timer_t m_timer = NRFX_TIMER_INSTANCE(1);
@@ -148,6 +149,10 @@ void event_handler(struct esb_evt const *event)
 					led_clock = (rx_payload.data[0] << 8) + rx_payload.data[1]; // sync led flashes :)
 					led_clock_offset = 0;
 					LOG_DBG("RX, timer reset");
+				}
+				else if (rx_payload.length == RIFT_ACK_LEN) // the receiver's timestamp: this packet's arrival on the beacon clock
+				{
+					rift_ts_ack(rx_payload.data, rx_payload.length, event->tx_attempts);
 				}
 			}
 		}
