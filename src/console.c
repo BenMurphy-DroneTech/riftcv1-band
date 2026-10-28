@@ -5,6 +5,7 @@
 #include "sensor/calibration.h"
 #include "connection/esb.h"
 #include "connection/rift_ts.h"
+#include "connection/rift_pulse.h"
 #include "build_defines.h"
 #include "parse_args.h"
 
@@ -493,6 +494,8 @@ static void print_help(void)
 	printk("battery                      Get battery information\n");
 	printk("stats                        Get radio packet counts since the last stats\n");
 	printk("pairs                        Timestamp pairs from the receiver and their line fit\n");
+	printk("pulse [on|off|width|at|trim] The frame-boundary LED pulse on D10 and D9\n");
+	printk("hold <ms>                    Ignore the receiver's timestamps (holdover test)\n");
 	printk("\nscan                         Restart sensor scan\n");
 	printk("calibrate                    Calibrate sensor ZRO\n");
 	printk("6-side                       Calibrate 6-side accelerometer\n");
@@ -552,6 +555,8 @@ static void console_thread(void)
 	const char command_battery[] = "battery";
 	const char command_stats[] = "stats";
 	const char command_pairs[] = "pairs";
+	const char command_pulse[] = "pulse";
+	const char command_hold[] = "hold";
 	const char command_scan[] = "scan";
 	const char command_calibrate[] = "calibrate";
 	const char command_6_side[] = "6-side";
@@ -632,6 +637,14 @@ static void console_thread(void)
 		else if (strcmp(argv[0], command_pairs) == 0)
 		{
 			rift_ts_print();
+		}
+		else if (strcmp(argv[0], command_pulse) == 0)
+		{
+			rift_pulse_command(argc, argv);
+		}
+		else if (strcmp(argv[0], command_hold) == 0)
+		{
+			rift_pulse_hold_command(argc, argv);
 		}
 		else if (strcmp(argv[0], command_scan) == 0)
 		{
