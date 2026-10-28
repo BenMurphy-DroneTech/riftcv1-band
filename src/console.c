@@ -490,6 +490,7 @@ static void print_help(void)
 	printk("uptime                       Get device uptime\n");
 	printk("reboot                       Soft reset the device\n");
 	printk("battery                      Get battery information\n");
+	printk("stats                        Get radio packet counts since the last stats\n");
 	printk("\nscan                         Restart sensor scan\n");
 	printk("calibrate                    Calibrate sensor ZRO\n");
 	printk("6-side                       Calibrate 6-side accelerometer\n");
@@ -547,6 +548,7 @@ static void console_thread(void)
 	const char command_uptime[] = "uptime";
 	const char command_reboot[] = "reboot";
 	const char command_battery[] = "battery";
+	const char command_stats[] = "stats";
 	const char command_scan[] = "scan";
 	const char command_calibrate[] = "calibrate";
 	const char command_6_side[] = "6-side";
@@ -619,6 +621,10 @@ static void console_thread(void)
 		else if (strcmp(argv[0], command_battery) == 0)
 		{
 			print_battery_tracker();
+		}
+		else if (strcmp(argv[0], command_stats) == 0)
+		{
+			esb_print_stats();
 		}
 		else if (strcmp(argv[0], command_scan) == 0)
 		{

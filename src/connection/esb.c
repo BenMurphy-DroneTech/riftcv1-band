@@ -44,6 +44,13 @@ uint32_t tx_errors = 0;
 int64_t last_tx_success = 0;
 int64_t last_tx_fail = 0;
 
+// Link statistics for the stats command
+static uint32_t stats_written = 0;
+static uint32_t stats_success = 0;
+static uint32_t stats_failed = 0;
+static uint32_t stats_flushed = 0;
+static int64_t stats_start = 0;
+
 static struct esb_payload rx_payload;
 static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0,
 														  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -80,6 +87,7 @@ void event_handler(struct esb_evt const *event)
 	switch (event->evt_id)
 	{
 	case ESB_EVENT_TX_SUCCESS:
+		stats_success++;
 		if (!paired_addr[0]) // zero, not paired
 			pairing_packets++; // keep track of pairing state
 		if (tx_errors >= TX_ERROR_THRESHOLD && tx_errors < TX_ERROR_THRESHOLD + TX_ERROR_CLEAR_RATE && last_tx_fail == 0)
@@ -96,6 +104,7 @@ void event_handler(struct esb_evt const *event)
 			clocks_stop();
 		break;
 	case ESB_EVENT_TX_FAILED:
+		stats_failed++;
 		if (tx_errors < TX_ERROR_MAX)
 			tx_errors++;
 		if (tx_errors == TX_ERROR_THRESHOLD && last_tx_success == 0) // consecutive failure to transmit
@@ -492,14 +501,30 @@ void esb_write(uint8_t *data)
 	tx_payload.noack = false;
 #endif
 	memcpy(tx_payload.data, data, tx_payload.length);
+	if (!esb_is_idle())
+		stats_flushed++;
 	esb_flush_tx(); // this will clear all transmissions even if they did not complete
 	esb_write_payload(&tx_payload); // Add transmission to queue
+	stats_written++;
 	send_data = true;
 }
 
 bool esb_ready(void)
 {
 	return esb_initialized && esb_paired;
+}
+
+void esb_print_stats(void)
+{
+	int64_t now = k_uptime_get();
+	int64_t ms = now - stats_start;
+	printk("Over %lld ms: %u written, %u acked, %u failed, %u flushed while busy\n",
+		   ms, stats_written, stats_success, stats_failed, stats_flushed);
+	stats_written = 0;
+	stats_success = 0;
+	stats_failed = 0;
+	stats_flushed = 0;
+	stats_start = now;
 }
 
 static void esb_thread(void)

@@ -58,5 +58,6 @@ void esb_clear_pair(void);
 void esb_write(uint8_t *data); // TODO: give packets some names
 
 bool esb_ready(void);
+void esb_print_stats(void);
 
 #endif
