@@ -57,6 +57,7 @@ void esb_clear_pair(void);
 
 void esb_write(uint8_t *data); // TODO: give packets some names
 void esb_write_len(const uint8_t *data, uint8_t length); // any length up to CONFIG_ESB_MAX_PAYLOAD_LENGTH
+void esb_write_noack(const uint8_t *data, uint8_t length); // the same, asking for no acknowledgement
 
 bool esb_ready(void);
 void esb_print_stats(void);

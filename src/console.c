@@ -7,6 +7,7 @@
 #include "connection/rift_ts.h"
 #include "connection/rift_pulse.h"
 #include "connection/rift_imu.h"
+#include "connection/rift_airtime.h"
 #include "build_defines.h"
 #include "parse_args.h"
 
@@ -499,6 +500,7 @@ static void print_help(void)
 	printk("hold <ms>                    Ignore the receiver's timestamps (holdover test)\n");
 	printk("imu [zero]                   IMU sample timing and half-frame slices\n");
 	printk("markers [<D10 id> <D9 id>]   Marker IDs for the roll call (1-30)\n");
+	printk("airtime [b <n> [<ms>]]       Radio time per packet; b sends n test packets B\n");
 	printk("\nscan                         Restart sensor scan\n");
 	printk("calibrate                    Calibrate sensor ZRO\n");
 	printk("6-side                       Calibrate 6-side accelerometer\n");
@@ -566,6 +568,7 @@ static void console_thread(void)
 	const char command_hold[] = "hold";
 	const char command_imu[] = "imu";
 	const char command_markers[] = "markers";
+	const char command_airtime[] = "airtime";
 	const char command_scan[] = "scan";
 	const char command_calibrate[] = "calibrate";
 	const char command_6_side[] = "6-side";
@@ -662,6 +665,10 @@ static void console_thread(void)
 		else if (strcmp(argv[0], command_markers) == 0)
 		{
 			rift_pulse_markers_command(argc, argv);
+		}
+		else if (strcmp(argv[0], command_airtime) == 0)
+		{
+			rift_airtime_command(argc, argv);
 		}
 		else if (strcmp(argv[0], command_scan) == 0)
 		{

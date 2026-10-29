@@ -32,6 +32,7 @@
 
 #include "esb.h"
 #include "rift_ts.h"
+#include "rift_airtime.h"
 
 uint8_t last_reset = 0;
 //const nrfx_timer_t m_timer = NRFX_TIMER_INSTANCE(1);
@@ -88,6 +89,7 @@ void event_handler(struct esb_evt const *event)
 	switch (event->evt_id)
 	{
 	case ESB_EVENT_TX_SUCCESS:
+		rift_airtime_done(true, event->tx_attempts);
 		stats_success++;
 		if (!paired_addr[0]) // zero, not paired
 			pairing_packets++; // keep track of pairing state
@@ -105,6 +107,7 @@ void event_handler(struct esb_evt const *event)
 			clocks_stop();
 		break;
 	case ESB_EVENT_TX_FAILED:
+		rift_airtime_done(false, event->tx_attempts);
 		stats_failed++;
 		if (tx_errors < TX_ERROR_MAX)
 			tx_errors++;
@@ -286,7 +289,7 @@ int esb_initialize(bool tx)
 		//config.tx_mode = ESB_TXMODE_MANUAL;
 		// config.payload_length = 32;
 		config.selective_auto_ack = true; // TODO: while pairing, should be set to false
-//		config.use_fast_ramp_up = true;
+		config.use_fast_ramp_up = IS_ENABLED(CONFIG_RIFT_FAST_RAMP_UP); // the receiver must match
 	}
 	else
 	{
@@ -301,7 +304,7 @@ int esb_initialize(bool tx)
 		// config.tx_mode = ESB_TXMODE_AUTO;
 		// config.payload_length = 32;
 		config.selective_auto_ack = true;
-//		config.use_fast_ramp_up = true;
+		config.use_fast_ramp_up = IS_ENABLED(CONFIG_RIFT_FAST_RAMP_UP);
 	}
 
 	err = esb_init(&config);
@@ -498,17 +501,21 @@ void esb_write(uint8_t *data)
 	esb_write_len(data, 21);
 }
 
-void esb_write_len(const uint8_t *data, uint8_t length)
+// The connection thread and the console (airtime b) both write
+static K_MUTEX_DEFINE(write_lock);
+
+static void esb_write_common(const uint8_t *data, uint8_t length, bool noack)
 {
 	if (!esb_initialized || !esb_paired)
 		return;
 	if (!clock_status)
 		clocks_start();
+	k_mutex_lock(&write_lock, K_FOREVER);
 	tx_payload.pipe = 1; // using base address 1
 #if defined(NRF54L15_XXAA) // TODO: esb halts with ack and tx fail
 	tx_payload.noack = true;
 #else
-	tx_payload.noack = false;
+	tx_payload.noack = noack;
 #endif
 	tx_payload.length = length;
 	memcpy(tx_payload.data, data, length);
@@ -517,12 +524,25 @@ void esb_write_len(const uint8_t *data, uint8_t length)
 	int64_t wait_until = k_uptime_get() + 3;
 	while (!esb_is_idle() && k_uptime_get() < wait_until)
 		k_usleep(50);
-	if (!esb_is_idle())
+	bool busy = !esb_is_idle();
+	if (busy)
 		stats_flushed++;
 	esb_flush_tx(); // this will clear all transmissions even if they did not complete
+	rift_airtime_start(length, tx_payload.noack, busy);
 	esb_write_payload(&tx_payload); // Add transmission to queue
 	stats_written++;
 	send_data = true;
+	k_mutex_unlock(&write_lock);
+}
+
+void esb_write_len(const uint8_t *data, uint8_t length)
+{
+	esb_write_common(data, length, false);
+}
+
+void esb_write_noack(const uint8_t *data, uint8_t length)
+{
+	esb_write_common(data, length, true);
 }
 
 bool esb_ready(void)
