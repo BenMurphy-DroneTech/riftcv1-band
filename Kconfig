@@ -12,6 +12,7 @@ config USE_SLIMENRF_CONSOLE
 
 config RIFT_FAST_RAMP_UP
     bool "ESB fast radio ramp-up"
+    default y
     help
       40 us radio ramp-ups in place of about 130 us, for the band packet
       timing plan's sub-slots. The receiver has to be built the same way.

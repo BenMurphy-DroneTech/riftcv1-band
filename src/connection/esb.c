@@ -51,7 +51,43 @@ static uint32_t stats_written = 0;
 static uint32_t stats_success = 0;
 static uint32_t stats_failed = 0;
 static uint32_t stats_flushed = 0;
+static uint32_t stats_stalls = 0;
 static int64_t stats_start = 0;
+
+// ESB busy this long with no TX event is stuck (four attempts take under 3 ms)
+#define STALL_MS 20
+static int64_t last_tx_event = 0;
+
+// The radio and ESB's timer (TIMER2) at the last stall, for stats
+static struct
+{
+	bool valid, timer_running;
+	uint32_t radio_state, radio_shorts, radio_int, ev_ready, ev_address, ev_end, ev_disabled;
+	uint32_t timer_shorts, cc[3], count, bitmode, ppi_chen;
+} stall;
+
+static void stall_snapshot(void)
+{
+	stall.radio_state = NRF_RADIO->STATE;
+	stall.radio_shorts = NRF_RADIO->SHORTS;
+	stall.radio_int = NRF_RADIO->INTENSET;
+	stall.ev_ready = NRF_RADIO->EVENTS_READY;
+	stall.ev_address = NRF_RADIO->EVENTS_ADDRESS;
+	stall.ev_end = NRF_RADIO->EVENTS_END;
+	stall.ev_disabled = NRF_RADIO->EVENTS_DISABLED;
+	stall.timer_shorts = NRF_TIMER2->SHORTS;
+	for (int i = 0; i < 3; i++)
+		stall.cc[i] = NRF_TIMER2->CC[i];
+	NRF_TIMER2->TASKS_CAPTURE[3] = 1; // (CC3 is free: ERRATA 216 only)
+	uint32_t t = NRF_TIMER2->CC[3];
+	stall.count = t;
+	stall.bitmode = NRF_TIMER2->BITMODE;
+	k_busy_wait(20);
+	NRF_TIMER2->TASKS_CAPTURE[3] = 1;
+	stall.timer_running = NRF_TIMER2->CC[3] != t;
+	stall.ppi_chen = NRF_PPI->CHEN;
+	stall.valid = true;
+}
 
 static struct esb_payload rx_payload;
 static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0,
@@ -90,6 +126,7 @@ void event_handler(struct esb_evt const *event)
 	{
 	case ESB_EVENT_TX_SUCCESS:
 		rift_airtime_done(true, event->tx_attempts);
+		last_tx_event = k_uptime_get();
 		stats_success++;
 		if (!paired_addr[0]) // zero, not paired
 			pairing_packets++; // keep track of pairing state
@@ -108,6 +145,7 @@ void event_handler(struct esb_evt const *event)
 		break;
 	case ESB_EVENT_TX_FAILED:
 		rift_airtime_done(false, event->tx_attempts);
+		last_tx_event = k_uptime_get();
 		stats_failed++;
 		if (tx_errors < TX_ERROR_MAX)
 			tx_errors++;
@@ -525,6 +563,16 @@ static void esb_write_common(const uint8_t *data, uint8_t length, bool noack)
 	while (!esb_is_idle() && k_uptime_get() < wait_until)
 		k_usleep(50);
 	bool busy = !esb_is_idle();
+	if (busy && k_uptime_get() - last_tx_event > STALL_MS)
+	{
+		// Busy with no TX event for so long: a transfer ESB can't finish (a lost ACK
+		// with no timeout running, see esb/esb.c). Start ESB again
+		stats_stalls++;
+		stall_snapshot();
+		esb_initialize(true);
+		last_tx_event = k_uptime_get();
+		busy = !esb_is_idle();
+	}
 	if (busy)
 		stats_flushed++;
 	esb_flush_tx(); // this will clear all transmissions even if they did not complete
@@ -554,13 +602,20 @@ void esb_print_stats(void)
 {
 	int64_t now = k_uptime_get();
 	int64_t ms = now - stats_start;
-	printk("Over %lld ms: %u written, %u acked, %u failed, %u flushed while busy\n",
-		   ms, stats_written, stats_success, stats_failed, stats_flushed);
+	printk("Over %lld ms: %u written, %u acked, %u failed, %u flushed while busy, %u stalls restarted\n",
+		   ms, stats_written, stats_success, stats_failed, stats_flushed, stats_stalls);
 	stats_written = 0;
 	stats_success = 0;
 	stats_failed = 0;
 	stats_flushed = 0;
+	stats_stalls = 0;
 	stats_start = now;
+	if (stall.valid)
+		printk("Last stall: radio state %u shorts %03x int %03x events ready %u address %u end %u disabled %u; "
+			   "TIMER2 %s at %u (bitmode %u) shorts %04x cc0 %u cc1 %u cc2 %u; PPI %08x\n",
+			   stall.radio_state, stall.radio_shorts, stall.radio_int, stall.ev_ready, stall.ev_address,
+			   stall.ev_end, stall.ev_disabled, stall.timer_running ? "running" : "stopped", stall.count,
+			   stall.bitmode, stall.timer_shorts, stall.cc[0], stall.cc[1], stall.cc[2], stall.ppi_chen);
 }
 
 static void esb_thread(void)

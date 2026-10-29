@@ -1375,6 +1375,14 @@ static void on_radio_disabled_tx(void)
 	nrf_timer_shorts_set(esb_timer.p_reg,
 		(NRF_TIMER_SHORT_COMPARE1_STOP_MASK | NRF_TIMER_SHORT_COMPARE1_CLEAR_MASK));
 
+	/* riftcv1: RADIO_DISABLED restarted the timer, and esb_fem_for_tx_set's COMPARE2
+	 * short stops it again ramp_up later: 40 us with fast ramp-up. A handler that
+	 * runs later than that finds it stopped, so the ACK timeout above never comes
+	 * and a lost ACK leaves the radio in RX for good. Start it again; a running
+	 * timer is unaffected.
+	 */
+	nrf_timer_task_trigger(esb_timer.p_reg, NRF_TIMER_TASK_START);
+
 	nrf_timer_event_clear(esb_timer.p_reg, NRF_TIMER_EVENT_COMPARE0);
 	nrf_timer_event_clear(esb_timer.p_reg, NRF_TIMER_EVENT_COMPARE1);
 
