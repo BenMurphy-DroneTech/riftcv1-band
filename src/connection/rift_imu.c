@@ -6,23 +6,23 @@
  * sensor thread READ_AFTER_US after each frame boundary and each half-frame,
  * once a sample past it is out, so a frame packet leaves soon after its
  * boundary (Smol Slime's own reads, on the IMU's FIFO threshold, came 13 to
- * 33 ms apart; a lower threshold stops its interrupt line ever falling). The
- * IMU's threshold stays as the fallback while there is no clock model.
+ * 33 ms apart; a lower threshold stops its interrupt line ever falling).
+ * Without a clock model the sensor loop's timeout reads instead.
  *
- * Sample timing. The IMU's FIFO-threshold interrupt edge is captured in TIMER3
- * CC5 through PPI (from the GPIOTE IN event Zephyr's GPIO driver set up for
- * it), so each read gives a pair: the edge's time, and how many gyro samples
- * the IMU had produced at the edge (the count read just after, less the
- * samples that came out between the edge and the count). A read without a
- * new edge gives none. The lower envelope of (edge time - period x count)
- * over the window gives the sample clock's phase, and the slope between its
- * two halves the period, followed slowly. A read with no new edge gives the
- * count read's own time instead: the newest sample came out at most a sample
- * period before it, and the grid's reads land at every phase of the sample
- * clock (about 760 us further each time), so those times sit above the same
- * envelope. (Reads woken by the IMU's own interrupt don't: they follow the
- * sample clock at their wake-up delay.) The LSM6DSV32X's FIFO timestamps
- * could replace all this later.
+ * Sample timing. The IMU's interrupt pin carries a pulse for every gyro
+ * sample (the driver sets pulsed gyro data-ready), captured in TIMER3 CC5
+ * through PPI from the GPIOTE IN event Zephyr's GPIO driver set up for it;
+ * the pin's CPU interrupt is off, so the pulses wake nothing. CC5 is read just
+ * before and just after the FIFO count: if it hasn't moved, it is the newest
+ * sample the count holds, and the read gives a pair (that sample's time, the
+ * gyro samples produced by then). If a sample came out during the count read
+ * the pair is ambiguous and dropped. The lower envelope of (time - period x
+ * count) over the window gives the sample clock's phase, and the slope
+ * between its two halves the period, followed slowly. Timing by the count
+ * read's own time instead (an earlier version, and the fallback without the
+ * pin) stepped 100-300 us at times. The same pulse exists on the LSM6DSV32X;
+ * on its SPI bus the count read takes microseconds, so pairs are almost never
+ * dropped.
  *
  * Slices. Each gyro sample covers the period up to its time; on the beacon
  * clock it is split at every half-frame boundary (k x period / 2), and each
@@ -84,7 +84,9 @@ static float env_step_max;            /* biggest envelope move between reads    
 static uint32_t n_resets;
 static uint32_t t_count;              /* this read's capture                    */
 static bool int_ready, int_failed;    /* the edge capture                       */
-static uint32_t t_edge_last, n_no_edge, n_miscounts;
+static uint32_t edge_before, t_edge;  /* CC5 before and after the count read  */
+static bool edge_ok;                  /* this read's pair is good              */
+static uint32_t n_no_edge, n_miscounts;
 
 /* this read's samples */
 static float gbuf[BUF][3], abuf[BUF][3];
@@ -159,7 +161,7 @@ static void edge_setup(void)
 	NRF_PPI->CH[ppi].EEP = (uint32_t)&NRF_GPIOTE->EVENTS_IN[ch];
 	NRF_PPI->CH[ppi].TEP = (uint32_t)&NRF_TIMER3->TASKS_CAPTURE[5];
 	NRF_PPI->CHENSET = BIT(ppi);
-	t_edge_last = NRF_TIMER3->CC[5];
+	NRF_GPIOTE->INTENCLR = BIT(ch);   /* the event stays; no CPU interrupt per sample */
 	int_ready = true;
 #else
 	int_failed = true;
@@ -175,9 +177,19 @@ void rift_imu_read_start(void)
 	n_g = n_a = 0;
 }
 
+void rift_imu_count_begin(void)
+{
+	edge_before = NRF_TIMER3->CC[5];
+}
+
 void rift_imu_count_read(void)
 {
 	t_count = rift_ts_now() - LATENCY_TICKS;
+	t_edge = NRF_TIMER3->CC[5];
+	int32_t age = (int32_t)(t_count - t_edge);
+
+	/* unmoved over the count read, and recent: the newest sample in the count */
+	edge_ok = int_ready && t_edge == edge_before && age >= 0 && age < 1.5f * period;
 }
 
 void rift_imu_gyro(const float g[3])
@@ -530,18 +542,10 @@ void rift_imu_read_end(float gyro_period_s)
 		timing_reset();   /* (more than BUF in one read: lost track) */
 	}
 	if (int_ready) {
-		uint32_t t_edge = NRF_TIMER3->CC[5];
-		int32_t since = (int32_t)(t_count - t_edge);
-
-		if (t_edge == t_edge_last) {
-			n_no_edge++;   /* no new edge: the FIFO stayed over its threshold */
-			timing_add(t_count, cum + n_g);   /* (see Sample timing) */
-		} else if (since >= 0) {
-			/* (an edge after the count read belongs to the next read) */
-			uint32_t after = (uint32_t)((float)since / period);
-
-			timing_add(t_edge, cum + n_g - MIN(after, n_g));
-			t_edge_last = t_edge;
+		if (edge_ok) {
+			timing_add(t_edge, cum + n_g);
+		} else {
+			n_no_edge++;   /* a sample came out during the count read, or no pulse */
 		}
 	} else {
 		timing_add(t_count, cum + n_g);
@@ -661,9 +665,9 @@ void rift_imu_command(int argc, char **argv)
 	print_f(16e6f / per, 2);
 	printk(" Hz (nominal ");
 	print_f(1.0f / nom, 2);
-	printk(" Hz), %u reads timed %s (%u without a new edge, %u miscounts dropped), envelope steps up to %d ns, "
-	       "%u timing restarts; %u slices (%u short), %u gaps, parts %u-%u\n", nr,
-	       int_ready ? "by the interrupt edge" : "by the count read", n_no_edge, n_miscounts,
+	printk(" Hz), %u reads timed %s (%u dropped as a sample came out during the count, %u miscounts), "
+	       "envelope steps up to %d ns, %u timing restarts; %u slices (%u short), %u gaps, parts %u-%u\n", nr,
+	       int_ready ? "by the sample pulse" : "by the count read", n_no_edge, n_miscounts,
 	       (int)(step * 62.5f), resets, made, partial, skipped,
 	       pmin == UINT16_MAX ? 0 : pmin, pmax);
 	k_msleep(5);

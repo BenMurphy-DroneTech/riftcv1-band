@@ -194,6 +194,7 @@ uint16_t lsm6dsm_data_read(uint8_t *data, uint16_t len)
 
 	uint8_t rawCount[4] = {0};
 
+	rift_imu_count_begin(); // the sample timing: was a sample out during the count?
 	err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_STATUS1, &rawCount[0], 2);
 	rift_imu_count_read(); // the moment of the count, for the sample timing
 	uint16_t count = (uint16_t)((rawCount[1] & 7) << 8 | rawCount[0]); // Turn the 16 bits into a unsigned 16-bit value
@@ -283,7 +284,10 @@ uint8_t lsm6dsm_setup_DRDY(uint16_t threshold)
 	buf[0] = threshold & 0xFF;
 	buf[1] = (threshold >> 8) & 0x07;
 	int err = ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_CTRL1, buf, 2);
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_INT1_CTRL, 0x08); // FIFO threshold interrupt
+	// riftcv1-band: INT1 pulses (75 us) on every gyro sample instead of the FIFO threshold:
+	// rift_imu times the samples by it, and the FIFO is read on the frame grid
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_DRDY_PULSE_CFG, 0x80); // DRDY_PULSED
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_INT1_CTRL, 0x02); // INT1_DRDY_G
 	if (err)
 		LOG_ERR("Communication error");
 	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW; // active low

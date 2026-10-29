@@ -27,6 +27,7 @@
 
 /* From the sensor loop, in order, for each FIFO read: */
 void rift_imu_read_start(void);        /* just before the read                      */
+void rift_imu_count_begin(void);       /* (IMU driver) just before reading the count */
 void rift_imu_count_read(void);        /* (IMU driver) just after reading the count */
 void rift_imu_gyro(const float g[3]);  /* each gyro sample, calibrated, deg/s       */
 void rift_imu_accel(const float a[3]); /* each accel sample, calibrated, g          */

@@ -550,6 +550,10 @@ volatile bool main_wfi = false;
 
 static void sensor_interrupt_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
+	// riftcv1-band: the IMU's pin pulses on every sample for rift_imu's timing and wakes
+	// nothing; only rift_sensor_wake (dev NULL) does
+	if (dev)
+		return;
 	// wake up sensor thread
 	if (main_wfi)
 	{
@@ -1166,7 +1170,8 @@ void sensor_loop(void)
 			k_msleep(sensor_update_time_ms + 10); // will be resumed by interrupt // TODO: dont use hard timeout
 			if (main_wfi) // timeout
 			{
-				LOG_WRN("Sensor interrupt timeout");
+				// riftcv1-band: the normal wake without a clock model (no frame grid)
+				// LOG_WRN("Sensor interrupt timeout");
 				main_wfi = false;
 			}
 		}
