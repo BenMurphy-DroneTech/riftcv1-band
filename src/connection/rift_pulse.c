@@ -106,9 +106,11 @@ static void timer3_isr(const void *arg)
 	}
 	uint32_t wake = on + (uint32_t)llround(period / m.rate) - 16 * WAKE_US;
 
-	/* A wake-up already past would wait for the timer to wrap (268 s) */
+	/* A wake-up already past would wait for the timer to wrap (268 s): try
+	 * again in a millisecond (not sooner, so a model gone wrong can't keep the
+	 * interrupt running) */
 	if ((int32_t)(wake - now_isr()) < 16 * 100) {
-		wake = now_isr() + 16 * 100;
+		wake = now_isr() + 16 * 1000;
 	}
 	NRF_TIMER3->CC[3] = wake;
 }

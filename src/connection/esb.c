@@ -495,6 +495,11 @@ void esb_clear_pair(void)
 
 void esb_write(uint8_t *data)
 {
+	esb_write_len(data, 21);
+}
+
+void esb_write_len(const uint8_t *data, uint8_t length)
+{
 	if (!esb_initialized || !esb_paired)
 		return;
 	if (!clock_status)
@@ -505,7 +510,8 @@ void esb_write(uint8_t *data)
 #else
 	tx_payload.noack = false;
 #endif
-	memcpy(tx_payload.data, data, tx_payload.length);
+	tx_payload.length = length;
+	memcpy(tx_payload.data, data, length);
 	// The connection thread writes some packets back to back: give the last one time for its
 	// retries (3 at 600 us, a beacon slot can cost one) before flushing it
 	int64_t wait_until = k_uptime_get() + 3;

@@ -26,6 +26,7 @@
 #include "build_defines.h"
 #include "hid.h"
 #include "system/battery_tracker.h"
+#include "rift_imu.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/crc.h>
@@ -39,6 +40,13 @@ static float sensor_q[4], sensor_a[3], sensor_m[3];
 static uint8_t data_buffer[21] = {0};
 static int64_t last_data_time = 0;
 static uint8_t packet_sequence = 0;
+
+/* rift_imu's frame packets (two half-frame slices and the orientation) take the place of
+ * Smol Slime's quaternion packets 1, 2, 4 and 7; the periodic 0, 3, 5 and 6 still go */
+#define RIFT_IMU_PACKETS 1
+K_MSGQ_DEFINE(rift_q, RIFT_IMU_LEN, 16, 4);
+static uint8_t rift_sequence;
+static uint32_t rift_queue_full;
 
 LOG_MODULE_REGISTER(connection, LOG_LEVEL_INF);
 
@@ -477,12 +485,28 @@ static int64_t last_info2_time = 0;
 static int64_t last_status_time = 0;
 static int64_t last_status2_time = 0;
 
+void connection_write_rift(uint8_t *data)
+{
+	data[1] = tracker_id;
+	data[RIFT_IMU_LEN - 1] = rift_sequence++;
+	if (k_msgq_put(&rift_q, data, K_NO_WAIT))
+		rift_queue_full++;
+	if (sleep)
+		k_wakeup(connection_thread_id);
+}
+
 void connection_thread(void)
 {
 	uint8_t data_copy[21];
+	static uint8_t rift_packet[RIFT_IMU_LEN];
 	// TODO: checking for connection_update events from sensor_loop, here we will time and send them out
 	while (1)
 	{
+		if (k_msgq_get(&rift_q, rift_packet, K_NO_WAIT) == 0)
+		{
+			esb_write_len(rift_packet, RIFT_IMU_LEN);
+			continue;
+		}
 		if (last_data_time != 0) // have valid data
 		{
 			int ret = k_mutex_lock(&data_buffer_mutex, K_MSEC(100));
@@ -499,7 +523,7 @@ void connection_thread(void)
 			esb_write(data_copy);
 		}
 		// mag is higher priority (skip accel, quat is full precision)
-		else if (mag_update_time && k_uptime_get() - last_mag_time > 200)
+		else if (!RIFT_IMU_PACKETS && mag_update_time && k_uptime_get() - last_mag_time > 200)
 		{
 			mag_update_time = 0; // data has been sent
 			last_mag_time = k_uptime_get();
@@ -507,7 +531,7 @@ void connection_thread(void)
 			continue;
 		}
 		// if time for info and precise quat not needed
-		else if (quat_update_time && !send_precise_quat && k_uptime_get() - last_info_time > 100)
+		else if (!RIFT_IMU_PACKETS && quat_update_time && !send_precise_quat && k_uptime_get() - last_info_time > 100)
 		{
 			quat_update_time = 0;
 			last_quat_time = k_uptime_get();
@@ -516,7 +540,7 @@ void connection_thread(void)
 			continue;
 		}
 		// if time for info2 and precise quat not needed
-		else if (quat_update_time && !send_precise_quat && k_uptime_get() - last_info2_time > 100)
+		else if (!RIFT_IMU_PACKETS && quat_update_time && !send_precise_quat && k_uptime_get() - last_info2_time > 100)
 		{
 			quat_update_time = 0;
 			last_quat_time = k_uptime_get();
@@ -525,7 +549,7 @@ void connection_thread(void)
 			continue;
 		}
 		// send quat otherwise
-		else if (quat_update_time)
+		else if (!RIFT_IMU_PACKETS && quat_update_time)
 		{
 			quat_update_time = 0;
 			last_quat_time = k_uptime_get();

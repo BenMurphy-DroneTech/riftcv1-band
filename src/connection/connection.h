@@ -41,6 +41,7 @@ void connection_update_status(int status);
 void connection_update_button(int button);
 
 void connection_set_shutdown(void);
+void connection_write_rift(uint8_t *data); // a rift_imu frame packet, RIFT_IMU_LEN bytes
 
 void connection_write_packet_0(void);
 void connection_write_packet_1(void);

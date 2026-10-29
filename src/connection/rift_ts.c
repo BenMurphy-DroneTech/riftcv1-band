@@ -33,6 +33,8 @@
 #define MODEL_PAIRS 8       /* fewer than this: no model to pulse from           */
 #define OUTLIER_NS  1000    /* dropped from the refit                            */
 #define GAP_MS      100000  /* a longer gap starts again (TIMER3 wraps in 268 s) */
+#define JUMP_US     1000    /* a pair this far off the model starts again too    */
+#define RATE_PPM    200     /* a fitted rate further off isn't a model           */
 
 struct pair {
 	uint64_t band;     /* TIMER3, 1/16 us, unwrapped     */
@@ -48,6 +50,7 @@ struct fit {
 
 static struct pair pairs[PAIRS];
 static uint32_t n_pairs, n_retried, n_no_capture, n_held, n_outliers;
+static uint32_t n_restarts;   /* (never cleared, unlike the others) */
 static uint32_t period_us;
 static uint64_t band_hi;
 static uint32_t band_last;
@@ -147,8 +150,19 @@ void rift_ts_ack(const uint8_t *data, uint8_t length, uint32_t attempts)
 	uint64_t band = band_hi | c;
 	const struct pair *prev = &pairs[(n_pairs + PAIRS - 1) % PAIRS];
 
-	/* Start again after a long gap, a new period or the beacon clock's wrap */
-	if (n_pairs && (now - last_ms > GAP_MS || period != period_us || beacon <= prev->beacon)) {
+	/* Start again after a long gap, a new period, the beacon clock's wrap, or a
+	 * pair far off the model (the clock jumped, as rift_test.py's wrap test makes
+	 * it: a fit across the jump would give a nonsense rate) */
+	bool jumped = false;
+
+	if (model.valid) {
+		double predicted = model.beacon_at + model.rate * (double)(int32_t)(c - model.band_at);
+
+		jumped = fabs((double)beacon - predicted) > 16.0 * JUMP_US;
+	}
+	if (n_pairs && (now - last_ms > GAP_MS || period != period_us || beacon <= prev->beacon ||
+			jumped)) {
+		n_restarts++;
 		n_pairs = n_retried = n_no_capture = n_held = n_outliers = 0;
 		model.valid = false;
 	}
@@ -244,6 +258,7 @@ static void fit_model(struct k_work *work)
 	uint32_t n = newest_pairs(f);
 	uint32_t period = period_us;
 	int64_t last = last_ms;
+	uint32_t generation = n_restarts;
 
 	irq_unlock(key);
 	if (n < 3) {
@@ -262,7 +277,7 @@ static void fit_model(struct k_work *work)
 	}
 
 	struct rift_model m = {
-		.valid = l.n >= MODEL_PAIRS,
+		.valid = l.n >= MODEL_PAIRS && fabs(l.b - 1.0) < RATE_PPM * 1e-6,
 		.pairs = l.n,
 		.band_at = (uint32_t)f[n - 1].band,
 		.beacon_at = (double)f[0].beacon + l.my +
@@ -274,7 +289,7 @@ static void fit_model(struct k_work *work)
 	};
 
 	key = irq_lock();
-	if (n_pairs) {          /* not restarted meanwhile */
+	if (generation == n_restarts) {   /* not restarted meanwhile */
 		model = m;
 		n_outliers += dropped;
 	}
@@ -312,8 +327,8 @@ void rift_ts_print(void)
 	n = newest_pairs(f);
 	irq_unlock(key);
 
-	printk("PAIRS %u fitted of %u (%u retried, %u without a capture, %u outliers dropped)", n,
-	       total, retried, no_capture, n_outliers);
+	printk("PAIRS %u fitted of %u (%u retried, %u without a capture, %u outliers dropped; "
+	       "%u restarts)", n, total, retried, no_capture, n_outliers, n_restarts);
 	if (n < 3) {
 		printk("\n");
 		return;

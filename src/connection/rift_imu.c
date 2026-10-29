@@ -20,18 +20,25 @@
  * (q = q x exp(w dt)) and the velocity change dv (dv += R(dq) a dt, gravity
  * included), both in the band's frame at the slice's start. The accelerometer
  * reading held is the latest one, so differing ODRs need nothing special.
+ *
+ * Packets. When a frame's second slice closes, its frame packet (rift_imu.h) is
+ * built; at the end of the read the fusion's orientation, taken back through
+ * the slices since to that slice's end, completes it, and connection sends it.
  */
 #include <math.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/util.h>
 #include <soc.h>
 #include <nrfx_gpiote.h>
 #include <nrfx_ppi.h>
 
 #include "rift_ts.h"
 #include "rift_imu.h"
+#include "connection.h"
 
 #define INT_NODE DT_PATH(zephyr_user)   /* Smol Slime's int0-gpios: the IMU's INT1 */
 
@@ -178,12 +185,15 @@ void rift_imu_accel(const float a[3])
 	n_a++;
 }
 
+static void packets_send(void);
+
 void rift_imu_quat(const float q[4], const float gyro_bias[3])
 {
 	memcpy(q_fused, q, sizeof(q_fused));
 	for (int i = 0; i < 3; i++) {
 		bias[i] = gyro_bias[i] * 57.29578f;
 	}
+	packets_send();
 }
 
 static void timing_reset(void)
@@ -278,13 +288,121 @@ static uint32_t sample_time(uint32_t m)
 
 static float half_s;   /* a slice's length, s */
 
+/* Frame packets waiting for their orientation: each frame's packet is built when
+ * its second slice closes, and q_since composes the slices after it, so that at
+ * the end of the read the fusion's orientation can be taken back to the frame's
+ * end boundary */
+#define PENDING 8
+static struct {
+	uint8_t pkt[RIFT_IMU_LEN];
+	float q_since[4];
+} pending[PENDING];
+static uint32_t n_pending, n_packets, n_no_room;
+static struct slice prev;
+static bool prev_whole, have_prev;
+
+static void put_i16(uint8_t *p, float v)
+{
+	long x = CLAMP(lroundf(v), -32767, 32767);
+
+	sys_put_le16((uint16_t)(int16_t)x, p);
+}
+
+/* A slice as its rotation vector and velocity change */
+static void put_slice(uint8_t *p, const struct slice *s)
+{
+	float q[4];
+
+	memcpy(q, s->dq, sizeof(q));
+	if (q[0] < 0) {
+		for (int i = 0; i < 4; i++) {
+			q[i] = -q[i];
+		}
+	}
+	float v = sqrtf(q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+	float f = v > 1e-9f ? 2.0f * atan2f(v, q[0]) / v : 2.0f;
+
+	for (int i = 0; i < 3; i++) {
+		put_i16(&p[2 * i], q[i + 1] * f * 32768.0f);
+		put_i16(&p[6 + 2 * i], s->dv[i] * 8192.0f);
+	}
+}
+
+static void packet_slice(const struct slice *s, bool whole)
+{
+	for (uint32_t i = 0; i < n_pending; i++) {
+		float t[4];
+
+		q_mul(t, pending[i].q_since, s->dq);
+		q_norm(t);
+		memcpy(pending[i].q_since, t, sizeof(t));
+	}
+	if (s->k & 1) {
+		if (n_pending == PENDING) {
+			n_no_room++;
+		} else {
+			uint8_t *p = pending[n_pending].pkt;
+
+			memset(p, 0, RIFT_IMU_LEN);
+			p[0] = RIFT_IMU_PACKET;
+			sys_put_le16((uint16_t)(s->k / 2), &p[2]);
+			if (have_prev && prev.k + 1 == s->k) {
+				put_slice(&p[4], &prev);
+				p[34] |= prev_whole ? BIT(0) : 0;
+			}
+			put_slice(&p[16], s);
+			p[34] |= whole ? BIT(1) : 0;
+			memcpy(pending[n_pending].q_since, (float[4]){1, 0, 0, 0}, sizeof(float[4]));
+			n_pending++;
+		}
+	}
+	prev = *s;
+	prev_whole = whole;
+	have_prev = true;
+}
+
+/* At the end of a read, with the fusion's orientation there: each waiting packet
+ * gets the orientation at its frame's end boundary, and goes */
+static void packets_send(void)
+{
+	for (uint32_t i = 0; i < n_pending; i++) {
+		float r[4], rc[4], qb[4];
+
+		if (in_slice) {
+			q_mul(r, pending[i].q_since, cur.dq);
+		} else {
+			memcpy(r, pending[i].q_since, sizeof(r));
+		}
+		q_norm(r);
+		rc[0] = r[0];
+		rc[1] = -r[1];
+		rc[2] = -r[2];
+		rc[3] = -r[3];
+		q_mul(qb, q_fused, rc);
+		q_norm(qb);
+		if (qb[0] < 0) {
+			for (int j = 0; j < 4; j++) {
+				qb[j] = -qb[j];
+			}
+		}
+		for (int j = 0; j < 3; j++) {
+			put_i16(&pending[i].pkt[28 + 2 * j], qb[j + 1] * 32767.0f);
+		}
+		connection_write_rift(pending[i].pkt);
+		n_packets++;
+	}
+	n_pending = 0;
+}
+
 static void slice_close(void)
 {
 	if (cur.parts) {
+		bool whole = cur.dt >= 0.99f * half_s;
+
 		q_norm(cur.dq);
 		done[n_done % SLICES] = cur;
 		n_done++;
-		if (cur.dt < 0.99f * half_s) {
+		if (!whole) {
 			n_partial++;   /* (samples missing from it) */
 		}
 		parts_min = MIN(parts_min, cur.parts);
@@ -295,6 +413,7 @@ static void slice_close(void)
 		q_norm(t);
 		memcpy(q_comp, t, sizeof(t));
 		comp_slices++;
+		packet_slice(&cur, whole);
 	}
 }
 
@@ -470,6 +589,8 @@ void rift_imu_command(int argc, char **argv)
 	       int_ready ? "by the interrupt edge" : "by the count read", n_no_edge,
 	       (int)(step * 62.5f), resets, made, partial, skipped,
 	       pmin == UINT16_MAX ? 0 : pmin, pmax);
+	k_msleep(5);
+	printk("IMU %u frame packets sent (%u with no room)\n", n_packets, n_no_room);
 	k_msleep(5);
 	printk("IMU since zero: %u slices composed ", comp);
 	print_f(q_angle_deg(qc), 2);

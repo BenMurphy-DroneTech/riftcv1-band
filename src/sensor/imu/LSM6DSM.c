@@ -1,4 +1,5 @@
 #include <math.h>
+#include <string.h>
 
 #include <zephyr/logging/log.h>
 #include <hal/nrf_gpio.h>
@@ -23,6 +24,8 @@ static const uint8_t odrs[] = {DSM_ODR_6_66kHz, DSM_ODR_3_33kHz, DSM_ODR_1_66kHz
 // last ODR is 12.5Hz, but we check 13Hz -> 1536 / 20000
 
 static uint8_t fifo_pattern_length;
+static uint8_t fifo_pattern_samples = 2; // samples in one FIFO pattern (gyro and accelerometer)
+static uint8_t fifo_ctrl5; // FIFO ODR and mode, to restart the FIFO
 static bool fifo_pattern_gyro_dominant; // if more samples are gyro than accel in a pattern
 
 LOG_MODULE_REGISTER(LSM6DSM, LOG_LEVEL_DBG);
@@ -163,6 +166,8 @@ int lsm6dsm_update_odr(float accel_time, float gyro_time, float *accel_actual_ti
 		fifo_pattern_length = gyro_time == 0 ? 1 : accel_time / gyro_time + 0.5f;
 	}
 
+	fifo_pattern_samples = (accel_time == 0 || gyro_time == 0) ? 1 : fifo_pattern_length + 1;
+
 	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_CTRL1, ODR_XL | accel_fs); // set accel ODR and FS
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_CTRL6, OP_MODE_XL); // set accelerator perf mode
 
@@ -171,7 +176,8 @@ int lsm6dsm_update_odr(float accel_time, float gyro_time, float *accel_actual_ti
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_CTRL4, GYRO_SLEEP); // set gyroscope awake/sleep mode
 
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_CTRL3, (DEC_G << 3) | DEC_XL); // set decimation
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_CTRL5, (ODR_FIFO >> 1) | 0x06); // set FIFO ODR, FIFO Continuous mode
+	fifo_ctrl5 = (ODR_FIFO >> 1) | 0x06;
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_CTRL5, fifo_ctrl5); // set FIFO ODR, FIFO Continuous mode
 	if (err)
 		LOG_ERR("Communication error");
 
@@ -192,6 +198,16 @@ uint16_t lsm6dsm_data_read(uint8_t *data, uint16_t len)
 	rift_imu_count_read(); // the moment of the count, for the sample timing
 	uint16_t count = (uint16_t)((rawCount[1] & 7) << 8 | rawCount[0]); // Turn the 16 bits into a unsigned 16-bit value
 
+	// riftcv1-band: a full FIFO (2048 words) reads a count of 0 (the field is 11 bits), and
+	// would never be read again: on an overrun with no count, empty it by bypass mode
+	if (count == 0 && (rawCount[1] & 0x60)) // OVER_RUN or FIFO_FULL_SMART
+	{
+		LOG_WRN("FIFO full, restarting it");
+		err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_CTRL5, fifo_ctrl5 & ~0x07); // bypass
+		err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_CTRL5, fifo_ctrl5); // continuous
+		return 0;
+	}
+
 	count /= PACKET_SIZE / 2; // words to "packets" (actually PACKET_SIZE - 1)
 	
 	const uint16_t limit = len / PACKET_SIZE;
@@ -200,18 +216,27 @@ uint16_t lsm6dsm_data_read(uint8_t *data, uint16_t len)
 		LOG_WRN("FIFO read buffer limit reached, %d packets dropped", count - limit);
 		count = limit;
 	}
-	for (int i = 0; i < count; i++)
+	// riftcv1-band: the pattern once, then the whole FIFO in one burst. Reading it a sample at a
+	// time (the pattern, then 6 bytes, two transactions each) took about 0.4 ms a sample at
+	// 400 kHz, more than the bus has at 833 Hz for gyro and accelerometer both.
+	err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_STATUS3, &rawCount[0], 2); // reading pattern
+	pattern = (uint16_t)((rawCount[1] & 3) << 8 | rawCount[0]);
+	if (pattern % 3 != 0 && count) // misaligned!
 	{
-		err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_STATUS3, &rawCount[0], 2); // reading pattern
-		pattern = (uint16_t)((rawCount[1] & 3) << 8 | rawCount[0]);
-		if (pattern % 3 != 0) // misaligned!
+		LOG_WRN("FIFO not aligned");
+		err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_DATA_OUT_L, rawCount, (3 - pattern % 3) * 2); // read and discard to the next sample
+		pattern = (pattern / 3 + 1) * 3;
+		count--;
+	}
+	if (count)
+	{
+		// samples into the buffer's tail, then each moved down to its packet (never overlapping)
+		err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_DATA_OUT_L, &data[count], count * (PACKET_SIZE - 1));
+		for (int i = 0; i < count; i++)
 		{
-			LOG_WRN("FIFO not aligned");
-			err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_DATA_OUT_L, rawCount, (pattern % 3) * 2); // read and discard misaligned axes
-			count--;
+			memmove(&data[i * PACKET_SIZE + 1], &data[count + i * (PACKET_SIZE - 1)], PACKET_SIZE - 1);
+			data[i * PACKET_SIZE] = (pattern / 3 + i) % fifo_pattern_samples;
 		}
-		data[i * PACKET_SIZE] = pattern / 3;
-		err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_DATA_OUT_L, &data[i * PACKET_SIZE + 1], PACKET_SIZE - 1);
 	}
 	if (err)
 		LOG_ERR("Communication error");

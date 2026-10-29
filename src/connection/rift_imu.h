@@ -8,6 +8,23 @@
 
 #include <stdint.h>
 
+/* The frame packet, band to receiver, once per camera frame, little-endian:
+ *   0      RIFT_IMU_PACKET
+ *   1      tracker id (connection fills it in)
+ *   2-3    frame number of its two slices, low 16 bits
+ *   4-15   first half-frame slice: rotation vector (3 x int16, 2^-15 rad) and
+ *          velocity change (3 x int16, 2^-13 m/s, gravity included), in the
+ *          band's frame at the slice's start
+ *   16-27  second half-frame slice, the same
+ *   28-33  orientation (the fusion's quaternion x, y, z, int16 / 32767, w >= 0)
+ *          at the frame's end boundary, which is the next frame's boundary
+ *   34     flags: bit 0 first slice whole, bit 1 second slice whole
+ *   35     sequence number (connection fills it in)
+ * The receiver (riftcv1-receiver) prints it as IMU <hex>; host/rift_imu.py in
+ * riftcv1-mocap decodes it. */
+#define RIFT_IMU_PACKET 0xe1
+#define RIFT_IMU_LEN    36
+
 /* From the sensor loop, in order, for each FIFO read: */
 void rift_imu_read_start(void);        /* just before the read                      */
 void rift_imu_count_read(void);        /* (IMU driver) just after reading the count */
