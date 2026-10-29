@@ -58,6 +58,14 @@ FILE(GLOB_RECURSE files vqf-c/src/*.c)
 target_sources(app PRIVATE ${files})
 
 target_include_directories(app PRIVATE src)
+
+# riftcv1: fast ramp-up needs a fix in ESB's PTX interrupt, so NCS's
+# subsys/esb/esb.c is swapped for the patched copy in esb/
+set(ESB_LIB ..__nrf__subsys__esb)
+get_target_property(esb_sources ${ESB_LIB} SOURCES)
+list(FILTER esb_sources EXCLUDE REGEX "(^|/)esb\\.c$")
+set_property(TARGET ${ESB_LIB} PROPERTY SOURCES ${esb_sources} ${CMAKE_CURRENT_SOURCE_DIR}/esb/esb.c)
+target_include_directories(${ESB_LIB} PRIVATE ${ZEPHYR_NRF_MODULE_DIR}/subsys/esb)
 target_include_directories(app PRIVATE vqf-c/src)
 
 # Force recompile for updated build timestamp
