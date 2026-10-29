@@ -2,6 +2,13 @@
  * rift_imu: the IMU's samples timed on TIMER3 and cut into half-frame slices
  * on the clock model (rift_ts).
  *
+ * Reads. Two TIMER4 compares, set from rift_pulse's interrupt each frame, wake the
+ * sensor thread READ_AFTER_US after each frame boundary and each half-frame,
+ * once a sample past it is out, so a frame packet leaves soon after its
+ * boundary (Smol Slime's own reads, on the IMU's FIFO threshold, came 13 to
+ * 33 ms apart; a lower threshold stops its interrupt line ever falling). The
+ * IMU's threshold stays as the fallback while there is no clock model.
+ *
  * Sample timing. The IMU's FIFO-threshold interrupt edge is captured in TIMER3
  * CC5 through PPI (from the GPIOTE IN event Zephyr's GPIO driver set up for
  * it), so each read gives a pair: the edge's time, and how many gyro samples
@@ -9,10 +16,13 @@
  * samples that came out between the edge and the count). A read without a
  * new edge gives none. The lower envelope of (edge time - period x count)
  * over the window gives the sample clock's phase, and the slope between its
- * two halves the period, followed slowly. Without the edge capture (no
- * interrupt pin) the count read's own time stands in, which Smol Slime's
- * interrupt-driven reads bias by their wake-up delay. (The LSM6DSV32X's FIFO
- * timestamps could replace all this later.)
+ * two halves the period, followed slowly. A read with no new edge gives the
+ * count read's own time instead: the newest sample came out at most a sample
+ * period before it, and the grid's reads land at every phase of the sample
+ * clock (about 760 us further each time), so those times sit above the same
+ * envelope. (Reads woken by the IMU's own interrupt don't: they follow the
+ * sample clock at their wake-up delay.) The LSM6DSV32X's FIFO timestamps
+ * could replace all this later.
  *
  * Slices. Each gyro sample covers the period up to its time; on the beacon
  * clock it is split at every half-frame boundary (k x period / 2), and each
@@ -29,6 +39,7 @@
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/irq.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
@@ -49,6 +60,7 @@
 #define SLICES       64     /* kept for the imu command                                 */
 #define LATENCY_TICKS 0     /* count read to TIMER3 capture (the driver's hook is close) */
 #define G            9.80665f
+#define READ_AFTER_US 1500 /* after a boundary: one sample period and some margin */
 
 struct read { uint32_t t, n; };
 
@@ -72,7 +84,7 @@ static float env_step_max;            /* biggest envelope move between reads    
 static uint32_t n_resets;
 static uint32_t t_count;              /* this read's capture                    */
 static bool int_ready, int_failed;    /* the edge capture                       */
-static uint32_t t_edge_last, n_no_edge;
+static uint32_t t_edge_last, n_no_edge, n_miscounts;
 
 /* this read's samples */
 static float gbuf[BUF][3], abuf[BUF][3];
@@ -185,6 +197,46 @@ void rift_imu_accel(const float a[3])
 	n_a++;
 }
 
+extern void rift_sensor_wake(void);   /* sensor.c */
+
+/* The read wake-ups: TIMER4 (16 MHz, free-running) compares 0 and 1 */
+static bool timer4_ready;
+static uint32_t n_grid_reads;
+
+static void timer4_isr(const void *arg)
+{
+	ARG_UNUSED(arg);
+	for (int i = 0; i < 2; i++) {
+		if (NRF_TIMER4->EVENTS_COMPARE[i]) {
+			NRF_TIMER4->EVENTS_COMPARE[i] = 0;
+			rift_sensor_wake();
+		}
+	}
+}
+
+void rift_imu_frame(int32_t boundary_us, uint32_t period_us)
+{
+	if (!timer4_ready) {
+		NRF_TIMER4->MODE = TIMER_MODE_MODE_Timer;
+		NRF_TIMER4->BITMODE = TIMER_BITMODE_BITMODE_32Bit;
+		NRF_TIMER4->PRESCALER = 0;
+		NRF_TIMER4->TASKS_CLEAR = 1;
+		NRF_TIMER4->TASKS_START = 1;
+		IRQ_CONNECT(TIMER4_IRQn, 2, timer4_isr, NULL, 0);
+		NRF_TIMER4->INTENSET = TIMER_INTENSET_COMPARE0_Msk | TIMER_INTENSET_COMPARE1_Msk;
+		irq_enable(TIMER4_IRQn);
+		timer4_ready = true;
+	}
+	uint32_t first = 16 * (uint32_t)(MAX(boundary_us, 0) + READ_AFTER_US);
+
+	NRF_TIMER4->TASKS_CAPTURE[2] = 1;
+	uint32_t now = NRF_TIMER4->CC[2];
+
+	NRF_TIMER4->CC[0] = now + first;
+	NRF_TIMER4->CC[1] = now + first + 8 * period_us;
+	n_grid_reads += 2;
+}
+
 static void packets_send(void);
 
 void rift_imu_quat(const float q[4], const float gyro_bias[3])
@@ -225,8 +277,14 @@ static void timing_add(uint32_t t, uint32_t n)
 	if (n_reads) {
 		float e = (float)(int32_t)(t - env_t0) - period * (float)(int32_t)(n - env_n0);
 
-		/* A sample earlier than the envelope, or a read long after: the
-		 * FIFO was reset or the rate changed, start again */
+		/* About a sample earlier than the envelope: a count one too many (an
+		 * edge's samples-after rounded the wrong way), drop the pair. Further
+		 * off, or a read long after: the FIFO was reset or the rate changed,
+		 * start again */
+		if (e < env - period / 2 && e > env - 1.5f * period && n_reads >= READS_GOOD) {
+			n_miscounts++;
+			return;
+		}
 		if (e < env - period / 2 || e > env + 40 * period) {
 			timing_reset();
 		}
@@ -296,7 +354,11 @@ static float half_s;   /* a slice's length, s */
 static struct {
 	uint8_t pkt[RIFT_IMU_LEN];
 	float q_since[4];
+	uint32_t end_k;    /* the frame's end boundary, in half-frames */
 } pending[PENDING];
+/* How long after its frame's end boundary each packet was queued, us */
+static uint32_t queued_n, queued_max;
+static uint64_t queued_sum;
 static uint32_t n_pending, n_packets, n_no_room;
 static struct slice prev;
 static bool prev_whole, have_prev;
@@ -346,6 +408,7 @@ static void packet_slice(const struct slice *s, bool whole)
 			memset(p, 0, RIFT_IMU_LEN);
 			p[0] = RIFT_IMU_PACKET;
 			sys_put_le16((uint16_t)(s->k / 2), &p[2]);
+			pending[n_pending].end_k = s->k + 1;
 			if (have_prev && prev.k + 1 == s->k) {
 				put_slice(&p[4], &prev);
 				p[34] |= prev_whole ? BIT(0) : 0;
@@ -389,6 +452,19 @@ static void packets_send(void)
 			put_i16(&pending[i].pkt[28 + 2 * j], qb[j + 1] * 32767.0f);
 		}
 		connection_write_rift(pending[i].pkt);
+		struct rift_model m;
+
+		rift_ts_model(&m);
+		if (m.valid) {
+			double now = m.beacon_at + m.rate * (double)(int32_t)(rift_ts_now() - m.band_at);
+			double us = (now - 8.0 * m.period_us * pending[i].end_k) / 16;
+
+			if (us >= 0 && us < 1e6) {
+				queued_n++;
+				queued_sum += (uint32_t)us;
+				queued_max = MAX(queued_max, (uint32_t)us);
+			}
+		}
 		n_packets++;
 	}
 	n_pending = 0;
@@ -459,6 +535,7 @@ void rift_imu_read_end(float gyro_period_s)
 
 		if (t_edge == t_edge_last) {
 			n_no_edge++;   /* no new edge: the FIFO stayed over its threshold */
+			timing_add(t_count, cum + n_g);   /* (see Sample timing) */
 		} else if (since >= 0) {
 			/* (an edge after the count read belongs to the next read) */
 			uint32_t after = (uint32_t)((float)since / period);
@@ -584,13 +661,17 @@ void rift_imu_command(int argc, char **argv)
 	print_f(16e6f / per, 2);
 	printk(" Hz (nominal ");
 	print_f(1.0f / nom, 2);
-	printk(" Hz), %u reads timed %s (%u without a new edge), envelope steps up to %d ns, "
+	printk(" Hz), %u reads timed %s (%u without a new edge, %u miscounts dropped), envelope steps up to %d ns, "
 	       "%u timing restarts; %u slices (%u short), %u gaps, parts %u-%u\n", nr,
-	       int_ready ? "by the interrupt edge" : "by the count read", n_no_edge,
+	       int_ready ? "by the interrupt edge" : "by the count read", n_no_edge, n_miscounts,
 	       (int)(step * 62.5f), resets, made, partial, skipped,
 	       pmin == UINT16_MAX ? 0 : pmin, pmax);
 	k_msleep(5);
-	printk("IMU %u frame packets sent (%u with no room)\n", n_packets, n_no_room);
+	printk("IMU %u frame packets sent (%u with no room); %u reads set on the frame grid; "
+	       "queued after the boundary: mean %u us, max %u us\n", n_packets, n_no_room, n_grid_reads,
+	       queued_n ? (uint32_t)(queued_sum / queued_n) : 0, queued_max);
+	queued_n = queued_max = 0;
+	queued_sum = 0;
 	k_msleep(5);
 	printk("IMU since zero: %u slices composed ", comp);
 	print_f(q_angle_deg(qc), 2);

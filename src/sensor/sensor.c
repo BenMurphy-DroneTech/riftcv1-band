@@ -530,7 +530,7 @@ void sensor_fusion_invalidate(void)
 	}
 }
 
-int sensor_update_time_ms = 6;
+int sensor_update_time_ms = 12; // riftcv1-band: the IMU's own threshold, only a fallback: rift_imu wakes the reads on the frame grid (Smol Slime: 6)
 
 // TODO: get rid of it.. ?
 static void set_update_time_ms(int time_ms)
@@ -563,6 +563,12 @@ static void sensor_interrupt_handler(const struct device *dev, struct gpio_callb
 		// need to signal to catch up thread
 		main_wfi = true;
 	}
+}
+
+// riftcv1-band: a FIFO read on the frame grid (rift_imu's timers), as if the IMU's interrupt had come
+void rift_sensor_wake(void)
+{
+	sensor_interrupt_handler(NULL, NULL, 0);
 }
 
 static struct gpio_callback sensor_cb_data;
@@ -894,7 +900,7 @@ void sensor_loop(void)
 				switch (sensor_mode)
 				{
 				case SENSOR_SENSOR_MODE_LOW_NOISE:
-					set_update_time_ms(6);
+					set_update_time_ms(12); // riftcv1-band: see sensor_update_time_ms
 					LOG_INF("Switching sensors to low noise");
 					break;
 				case SENSOR_SENSOR_MODE_LOW_POWER:
@@ -1074,7 +1080,8 @@ void sensor_loop(void)
 			}
 
 			// Also check if expected number of timesteps when using FIFO threshold, if FIFO threshold is being used
-			if (last_sensor_fifo_threshold && processed_timesteps && processed_timesteps != last_sensor_fifo_threshold)
+			// riftcv1-band: not on reads set by rift_imu's frame grid, which never match the threshold
+			if (0 && last_sensor_fifo_threshold && processed_timesteps && processed_timesteps != last_sensor_fifo_threshold)
 				LOG_WRN("Expected %d timestep%s, got %d", last_sensor_fifo_threshold, last_sensor_fifo_threshold == 1 ? "" : "s", processed_timesteps);
 
 			// Update fusion gyro sanity? // TODO: use to detect drift and correct or suspend tracking

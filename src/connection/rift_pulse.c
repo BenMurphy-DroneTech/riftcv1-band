@@ -27,6 +27,7 @@
 
 #include "rift_ts.h"
 #include "rift_pulse.h"
+#include "rift_imu.h"
 
 #define WAKE_US      1000   /* wake-up before the pulse                */
 #define MIN_LEAD_US  50     /* less than this to the pulse: skip it    */
@@ -88,6 +89,9 @@ static void timer3_isr(const void *arg)
 	double beacon_now = m.beacon_at + m.rate * (double)(int32_t)(now - m.band_at);
 	double k = ceil((beacon_now + 16.0 * MIN_LEAD_US - first) / period);
 	double on_beacon = k * period + first;
+	uint32_t boundary = m.band_at + (uint32_t)(int32_t)llround((k * period - m.beacon_at) / m.rate);
+
+	rift_imu_frame((int32_t)(boundary - now) / 16, m.period_us);   /* the IMU's reads */
 	uint32_t on = m.band_at + (uint32_t)(int32_t)llround((on_beacon - m.beacon_at) / m.rate);
 	uint32_t off = on + (uint32_t)llround(16.0 * width_us / m.rate);
 	int32_t lead = (int32_t)(on - now_isr());

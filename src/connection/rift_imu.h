@@ -34,6 +34,10 @@ void rift_imu_read_end(float gyro_period_s); /* the gyro's nominal sample period
 void rift_imu_quat(const float q[4], const float gyro_bias[3]); /* the fusion's
 		orientation after the read, and its gyro bias estimate (rad/s, as VQF's)  */
 
+/* From rift_pulse's interrupt once a frame: the boundary is boundary_us away.
+ * Schedules the FIFO reads READ_AFTER_US after it and after the half-frame. */
+void rift_imu_frame(int32_t boundary_us, uint32_t period_us);
+
 /* The imu console command: imu [zero]. */
 void rift_imu_command(int argc, char **argv);
 
