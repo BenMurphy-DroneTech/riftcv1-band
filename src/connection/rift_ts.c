@@ -6,7 +6,9 @@
  * TXREADY (the capture channel is in a group that TXREADY enables and the
  * capture itself disables), so the acknowledgement's own ADDRESS never
  * overwrites the packet's. A retried packet's capture is its last attempt,
- * the one the receiver timed. CC1-CC4 belong to rift_pulse; CC5 captures now.
+ * the one the receiver timed. CC1-CC3 belong to rift_pulse, CC4 captures now
+ * (for rift_pulse's interrupt and rift_ts_now) and CC5 the IMU's interrupt
+ * edge (rift_imu).
  *
  * Every new single-attempt pair refits the model in a work item: a least-squares
  * line through the newest FIT_PAIRS of them, refitted once without any pair
@@ -106,8 +108,14 @@ SYS_INIT(rift_ts_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
 uint32_t rift_ts_now(void)
 {
-	NRF_TIMER3->TASKS_CAPTURE[5] = 1;
-	return NRF_TIMER3->CC[5];
+	unsigned int key = irq_lock();   /* (rift_pulse's interrupt captures CC4 too) */
+
+	NRF_TIMER3->TASKS_CAPTURE[4] = 1;
+
+	uint32_t t = NRF_TIMER3->CC[4];
+
+	irq_unlock(key);
+	return t;
 }
 
 void rift_ts_ack(const uint8_t *data, uint8_t length, uint32_t attempts)

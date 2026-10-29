@@ -6,6 +6,7 @@
 #include "LSM6DSM.h"
 #include "LSM6DSV.h" // Common functions
 #include "sensor/sensor_none.h"
+#include "connection/rift_imu.h"
 
 #define PACKET_SIZE 7 // first byte is pattern, only 6 actual sample bytes
 
@@ -188,6 +189,7 @@ uint16_t lsm6dsm_data_read(uint8_t *data, uint16_t len)
 	uint8_t rawCount[4] = {0};
 
 	err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_STATUS1, &rawCount[0], 2);
+	rift_imu_count_read(); // the moment of the count, for the sample timing
 	uint16_t count = (uint16_t)((rawCount[1] & 7) << 8 | rawCount[0]); // Turn the 16 bits into a unsigned 16-bit value
 
 	count /= PACKET_SIZE / 2; // words to "packets" (actually PACKET_SIZE - 1)

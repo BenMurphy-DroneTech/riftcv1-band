@@ -8,7 +8,7 @@
  *   CC3  wake-up interrupt WAKE_US before the next pulse: it converts that
  *        frame's boundary to TIMER3 ticks from the model, loads CC1 and CC2,
  *        and sets CC3 for the frame after
- *   CC4  the interrupt's capture of now
+ *   CC4  the interrupt's capture of now (rift_ts_now uses it too)
  * A boundary is k * period on the beacon clock; the pulse is centred at the
  * boundary + at + trim (at: a test shift, trim: the fixed radio and driver
  * delays). The PPI channels are on only while pulses are being placed, so a

@@ -24,6 +24,7 @@
 #include "system/system.h"
 #include "util.h"
 #include "connection/connection.h"
+#include "connection/rift_imu.h"
 #include "calibration.h"
 
 #include <math.h>
@@ -129,7 +130,7 @@ static int sensor_scan(void);
 static int sensor_init(void);
 static void sensor_loop(void);
 static struct k_thread sensor_thread_id;
-static K_THREAD_STACK_DEFINE(sensor_thread_id_stack, 1024);
+static K_THREAD_STACK_DEFINE(sensor_thread_id_stack, 1536); // (rift_imu runs in it too)
 
 K_THREAD_DEFINE(sensor_init_thread_id, 256, sensor_request_scan, true, NULL, NULL, SENSOR_REQUEST_SCAN_THREAD_PRIORITY, 0, 0);
 //crashing on nrf54l at 256
@@ -857,6 +858,7 @@ void sensor_loop(void)
 				set_status(SYS_STATUS_SENSOR_ERROR, true);
 				main_ok = false;
 			}
+			rift_imu_read_start();
 			uint16_t packets = sensor_imu->data_read(raw_data, data_size); // TODO: name this better?
 
 			// Debug info
@@ -934,6 +936,7 @@ void sensor_loop(void)
 					float gy = raw_g[1];
 					float gz = raw_g[2];
 					float g[] = {gx, gy, gz};
+					rift_imu_gyro(g);
 
 					// Process fusion
 #if DEBUG
@@ -968,6 +971,7 @@ void sensor_loop(void)
 					float ay = raw_a[1];
 					float az = raw_a[2];
 					float a[] = {ax, ay, az};
+					rift_imu_accel(a);
 
 					// Process fusion
 #if DEBUG
@@ -994,6 +998,7 @@ void sensor_loop(void)
 
 			// If sensors have asymmetric packets in FIFO, timesteps will not match packet count
 			int processed_timesteps = MAX(g_count, a_count);
+			rift_imu_read_end(gyro_actual_time);
 
 			// Free the FIFO buffer
 			k_free(raw_data);
@@ -1080,6 +1085,9 @@ void sensor_loop(void)
 			int64_t fuse_time = k_uptime_ticks();
 #endif
 			sensor_fusion->get_quat(q);
+			float rift_bias[3] = {0};
+			sensor_fusion->get_gyro_bias(rift_bias);
+			rift_imu_quat(q, rift_bias);
 #if DEBUG
 			if (valid_acquisition)
 				total_quat_fuse_time += k_uptime_ticks() - fuse_time;
