@@ -150,7 +150,7 @@ void event_handler(struct esb_evt const *event)
 					led_clock_offset = 0;
 					LOG_DBG("RX, timer reset");
 				}
-				else if (rx_payload.length == RIFT_ACK_LEN) // the receiver's timestamp: this packet's arrival on the beacon clock
+				else if (rx_payload.length >= RIFT_ACK_LEN) // the receiver's timestamp: this packet's arrival on the beacon clock (and maybe a command)
 				{
 					rift_ts_ack(rx_payload.data, rx_payload.length, event->tx_attempts);
 				}

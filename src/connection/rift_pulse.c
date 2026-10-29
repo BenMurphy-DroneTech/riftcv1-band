@@ -3,7 +3,8 @@
  * from the clock model (rift_ts), on the test band's D10 (P1.15) and D9 (P1.14).
  *
  * TIMER3 (rift_ts's 16 MHz timer) compares:
- *   CC1  LED on:  PPI to GPIOTE SET on D10, forked to SET on D9
+ *   CC1  LED on:  a PPI channel per pin to its GPIOTE SET, each enabled only
+ *        for a frame its channel is lit in
  *   CC2  LED off: PPI to GPIOTE CLR on both
  *   CC3  wake-up interrupt WAKE_US before the next pulse: it converts that
  *        frame's boundary to TIMER3 ticks from the model, loads CC1 and CC2,
@@ -15,6 +16,13 @@
  * stale compare never lights the LEDs. A wake-up that finds the pulse less than
  * MIN_LEAD_US away skips that frame rather than pulsing late. With no model,
  * or no new pair for HOLDOVER_MS, the band stays dark.
+ *
+ * Commands (in the receiver's acknowledgements, through rift_ts) name a frame
+ * N, the one whose exposure is centred on boundary N. Roll call: in frames N to
+ * N+4 each channel is dark in frame N+k when bit k of its marker ID (1-30) is
+ * set. Blink: one channel dark in frame N. Sleep-all: the band powers off at
+ * frame N, as a press does. Until a join reply gives them, the marker IDs are
+ * set on the console (markers), MARKER_IDS at start.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +36,7 @@
 #include "rift_ts.h"
 #include "rift_pulse.h"
 #include "rift_imu.h"
+#include "system/power.h"
 
 #define WAKE_US      1000   /* wake-up before the pulse                */
 #define MIN_LEAD_US  50     /* less than this to the pulse: skip it    */
@@ -46,11 +55,68 @@ static uint32_t width_us = WIDTH_US;
 static int32_t at_ns, trim_ns = TRIM_NS;
 static uint32_t holdover_ms = HOLDOVER_MS;
 
-static nrf_ppi_channel_t on_ch, off_ch;
+static nrf_ppi_channel_t on_ch[ARRAY_SIZE(pins)], off_ch;
 static uint8_t gpiote_ch[ARRAY_SIZE(pins)];
 static bool ready, pulsing;
 static uint32_t n_placed, n_late, n_dark;
 static int32_t lead_min_us = INT32_MAX;
+
+/* Commands and marker IDs (see the top) */
+static uint8_t marker_id[ARRAY_SIZE(pins)] = {1, 2};   /* MARKER_IDS */
+static volatile bool roll_live, blink_live, sleep_live;
+static volatile uint32_t roll_frame, blink_frame, sleep_frame;
+static volatile uint8_t blink_ch;
+static uint32_t n_cmds, n_dark_pulses[ARRAY_SIZE(pins)];
+
+static void sleep_now(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	printk("PULSE sleep-all: powering off\n");
+	sys_request_system_off(false);
+}
+K_WORK_DEFINE(sleep_work, sleep_now);
+
+/* The channels left dark in frame */
+static uint8_t dark_mask(uint32_t frame)
+{
+	uint8_t mask = 0;
+
+	if (roll_live) {
+		uint32_t k = frame - roll_frame;
+
+		if (k < 5) {
+			for (int i = 0; i < ARRAY_SIZE(pins); i++) {
+				mask |= (marker_id[i] >> k & 1) << i;
+			}
+		} else if ((int32_t)k >= 5) {
+			roll_live = false;
+		}
+	}
+	if (blink_live) {
+		if (frame == blink_frame) {
+			mask |= BIT(blink_ch);
+		} else if ((int32_t)(frame - blink_frame) > 0) {
+			blink_live = false;
+		}
+	}
+	return mask;
+}
+
+void rift_pulse_band_command(uint8_t type, uint32_t frame, uint8_t arg)
+{
+	n_cmds++;
+	if (type == RIFT_CMD_ROLL_CALL) {
+		roll_frame = frame;
+		roll_live = true;
+	} else if (type == RIFT_CMD_BLINK && arg < ARRAY_SIZE(pins)) {
+		blink_frame = frame;
+		blink_ch = arg;
+		blink_live = true;
+	} else if (type == RIFT_CMD_SLEEP_ALL) {
+		sleep_frame = frame;
+		sleep_live = true;
+	}
+}
 
 static inline uint32_t now_isr(void)
 {
@@ -60,7 +126,7 @@ static inline uint32_t now_isr(void)
 
 static void dark(void)
 {
-	NRF_PPI->CHENCLR = BIT(on_ch) | BIT(off_ch);
+	NRF_PPI->CHENCLR = BIT(on_ch[0]) | BIT(on_ch[1]) | BIT(off_ch);
 	for (int i = 0; i < ARRAY_SIZE(pins); i++) {
 		NRF_GPIOTE->TASKS_CLR[gpiote_ch[i]] = 1;
 	}
@@ -96,13 +162,29 @@ static void timer3_isr(const void *arg)
 	uint32_t off = on + (uint32_t)llround(16.0 * width_us / m.rate);
 	int32_t lead = (int32_t)(on - now_isr());
 
+	uint32_t frame = (uint32_t)(int64_t)k;
+
+	if (sleep_live && (int32_t)(frame - sleep_frame) >= 0) {
+		sleep_live = false;
+		k_work_submit(&sleep_work);
+	}
 	if (lead < 16 * MIN_LEAD_US) {
 		n_late++;       /* (the wake-up ran late: skip it, never pulse late) */
 	} else {
+		uint8_t mask = dark_mask(frame);
+
 		NRF_TIMER3->CC[1] = on;
 		NRF_TIMER3->CC[2] = off;
+		for (int i = 0; i < ARRAY_SIZE(pins); i++) {
+			if (mask & BIT(i)) {
+				NRF_PPI->CHENCLR = BIT(on_ch[i]);
+				n_dark_pulses[i]++;
+			} else {
+				NRF_PPI->CHENSET = BIT(on_ch[i]);
+			}
+		}
 		if (!pulsing) {
-			NRF_PPI->CHENSET = BIT(on_ch) | BIT(off_ch);
+			NRF_PPI->CHENSET = BIT(off_ch);
 			pulsing = true;
 		}
 		n_placed++;
@@ -129,7 +211,8 @@ void rift_pulse_init(void)
 			return;
 		}
 	}
-	if (nrfx_ppi_channel_alloc(&on_ch) != NRFX_SUCCESS ||
+	if (nrfx_ppi_channel_alloc(&on_ch[0]) != NRFX_SUCCESS ||
+	    nrfx_ppi_channel_alloc(&on_ch[1]) != NRFX_SUCCESS ||
 	    nrfx_ppi_channel_alloc(&off_ch) != NRFX_SUCCESS) {
 		printk("rift_pulse: no PPI channels\n");
 		return;
@@ -149,9 +232,10 @@ void rift_pulse_init(void)
 			(GPIOTE_CONFIG_POLARITY_Toggle << GPIOTE_CONFIG_POLARITY_Pos) |
 			(GPIOTE_CONFIG_OUTINIT_Low << GPIOTE_CONFIG_OUTINIT_Pos);
 	}
-	NRF_PPI->CH[on_ch].EEP = (uint32_t)&NRF_TIMER3->EVENTS_COMPARE[1];
-	NRF_PPI->CH[on_ch].TEP = (uint32_t)&NRF_GPIOTE->TASKS_SET[gpiote_ch[0]];
-	NRF_PPI->FORK[on_ch].TEP = (uint32_t)&NRF_GPIOTE->TASKS_SET[gpiote_ch[1]];
+	for (int i = 0; i < ARRAY_SIZE(pins); i++) {
+		NRF_PPI->CH[on_ch[i]].EEP = (uint32_t)&NRF_TIMER3->EVENTS_COMPARE[1];
+		NRF_PPI->CH[on_ch[i]].TEP = (uint32_t)&NRF_GPIOTE->TASKS_SET[gpiote_ch[i]];
+	}
 	NRF_PPI->CH[off_ch].EEP = (uint32_t)&NRF_TIMER3->EVENTS_COMPARE[2];
 	NRF_PPI->CH[off_ch].TEP = (uint32_t)&NRF_GPIOTE->TASKS_CLR[gpiote_ch[0]];
 	NRF_PPI->FORK[off_ch].TEP = (uint32_t)&NRF_GPIOTE->TASKS_CLR[gpiote_ch[1]];
@@ -234,6 +318,25 @@ void rift_pulse_command(int argc, char **argv)
 		return;
 	}
 	print_status();
+}
+
+void rift_pulse_markers_command(int argc, char **argv)
+{
+	if (argc == 3) {
+		long a = strtol(argv[1], NULL, 10), b = strtol(argv[2], NULL, 10);
+
+		if (a < 1 || a > 30 || b < 1 || b > 30) {
+			printk("markers <D10 id> <D9 id>: 1 to 30\n");
+			return;
+		}
+		marker_id[0] = a;
+		marker_id[1] = b;
+	} else if (argc != 1) {
+		printk("markers [<D10 id> <D9 id>]\n");
+		return;
+	}
+	printk("MARKERS %u %u; %u commands taken; dark pulses %u %u\n", marker_id[0], marker_id[1],
+	       n_cmds, n_dark_pulses[0], n_dark_pulses[1]);
 }
 
 void rift_pulse_hold_command(int argc, char **argv)

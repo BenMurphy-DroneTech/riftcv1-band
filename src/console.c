@@ -498,6 +498,7 @@ static void print_help(void)
 	printk("pulse [on|off|width|at|trim] The frame-boundary LED pulse on D10 and D9\n");
 	printk("hold <ms>                    Ignore the receiver's timestamps (holdover test)\n");
 	printk("imu [zero]                   IMU sample timing and half-frame slices\n");
+	printk("markers [<D10 id> <D9 id>]   Marker IDs for the roll call (1-30)\n");
 	printk("\nscan                         Restart sensor scan\n");
 	printk("calibrate                    Calibrate sensor ZRO\n");
 	printk("6-side                       Calibrate 6-side accelerometer\n");
@@ -541,7 +542,11 @@ static void console_thread(void)
 
 #if USB_EXISTS
 	console_getline_init();
-	while (log_data_pending())
+	// riftcv1-band: wait at most 0.5 s for the log to drain: input arriving meanwhile fills the USB
+	// buffers, the driver logs an error on every retry and the log never drained, so the console
+	// never started
+	int64_t log_wait_end = k_uptime_get() + 500;
+	while (log_data_pending() && k_uptime_get() < log_wait_end)
 		k_usleep(1);
 	k_msleep(100);
 	printk("*** " CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT " ***\n");
@@ -560,6 +565,7 @@ static void console_thread(void)
 	const char command_pulse[] = "pulse";
 	const char command_hold[] = "hold";
 	const char command_imu[] = "imu";
+	const char command_markers[] = "markers";
 	const char command_scan[] = "scan";
 	const char command_calibrate[] = "calibrate";
 	const char command_6_side[] = "6-side";
@@ -652,6 +658,10 @@ static void console_thread(void)
 		else if (strcmp(argv[0], command_imu) == 0)
 		{
 			rift_imu_command(argc, argv);
+		}
+		else if (strcmp(argv[0], command_markers) == 0)
+		{
+			rift_pulse_markers_command(argc, argv);
 		}
 		else if (strcmp(argv[0], command_scan) == 0)
 		{

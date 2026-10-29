@@ -60,6 +60,7 @@
 #define SLICES       64     /* kept for the imu command                                 */
 #define LATENCY_TICKS 0     /* count read to TIMER3 capture (the driver's hook is close) */
 #define G            9.80665f
+#define SPAN_JOIN_US 100   /* a sample starting this near the last one's end joins it */
 #define READ_AFTER_US 1500 /* after a boundary: one sample period and some margin */
 
 struct read { uint32_t t, n; };
@@ -95,6 +96,8 @@ static uint16_t n_g, n_a;
 
 /* slices */
 static bool in_slice;
+static bool have_span;
+static double span_end;   /* the last sample's end, beacon clock */
 static struct slice cur;
 static float a_held[3];
 static struct slice done[SLICES];
@@ -265,6 +268,7 @@ static void timing_reset(void)
 	n_reads = head = 0;
 	env_step_max = 0;
 	in_slice = false;
+	have_span = false;
 	n_resets++;
 }
 
@@ -375,6 +379,33 @@ static uint32_t n_pending, n_packets, n_no_room;
 static struct slice prev;
 static bool prev_whole, have_prev;
 
+/* Holes: frames with no packet built. Why each happened: everything seen since
+ * the last packet built, and the longest gap between reads */
+#define WHY_TIMING    BIT(0)   /* the IMU sample timing not settled */
+#define WHY_MODEL     BIT(1)   /* no valid clock model              */
+#define WHY_ROOM      BIT(2)   /* no room for the packet            */
+#define WHY_SLICE_GAP BIT(3)   /* a slice skipped                   */
+static uint8_t why_since;
+static uint32_t gap_since, last_read_ms, n_untimed_timing, n_untimed_model;
+static uint32_t last_built, n_holes, hole_frames, hole_at_ms, hole_gap_ms;
+static uint8_t hole_why;
+static bool built_any;
+
+static void hole_check(uint32_t frame)
+{
+	if (built_any && frame - last_built > 1 && frame - last_built < 100000) {
+		n_holes++;
+		hole_frames = frame - last_built - 1;
+		hole_at_ms = k_uptime_get_32();
+		hole_why = why_since;
+		hole_gap_ms = gap_since;
+	}
+	last_built = frame;
+	built_any = true;
+	why_since = 0;
+	gap_since = 0;
+}
+
 static void put_i16(uint8_t *p, float v)
 {
 	long x = CLAMP(lroundf(v), -32767, 32767);
@@ -414,8 +445,11 @@ static void packet_slice(const struct slice *s, bool whole)
 	if (s->k & 1) {
 		if (n_pending == PENDING) {
 			n_no_room++;
+			why_since |= WHY_ROOM;
 		} else {
 			uint8_t *p = pending[n_pending].pkt;
+
+			hole_check(s->k / 2);
 
 			memset(p, 0, RIFT_IMU_LEN);
 			p[0] = RIFT_IMU_PACKET;
@@ -553,6 +587,20 @@ void rift_imu_read_end(float gyro_period_s)
 
 	rift_ts_model(&m);
 	bool timed = n_reads >= READS_GOOD && m.valid;
+	uint32_t now_ms = k_uptime_get_32();
+
+	if (last_read_ms) {
+		gap_since = MAX(gap_since, now_ms - last_read_ms);
+	}
+	last_read_ms = now_ms;
+	if (n_reads < READS_GOOD) {
+		n_untimed_timing++;
+		why_since |= WHY_TIMING;
+	}
+	if (!m.valid) {
+		n_untimed_model++;
+		why_since |= WHY_MODEL;
+	}
 	double half = 8.0 * m.period_us;    /* half a frame, 1/16 us */
 
 	half_s = m.period_us / 2e6f;
@@ -572,6 +620,14 @@ void rift_imu_read_end(float gyro_period_s)
 		double x0 = x1 - m.rate * (double)period;
 		float w[3];
 
+		/* Start where the last sample ended: the timing moves by fractions of a
+		 * us, and an overlap across a boundary would open its slice again */
+		if (have_span && fabs(x0 - span_end) < 16.0 * SPAN_JOIN_US && x1 > span_end) {
+			x0 = span_end;
+		}
+		span_end = x1;
+		have_span = true;
+
 		for (int i = 0; i < 3; i++) {
 			w[i] = (gbuf[j][i] - bias[i]) * 0.01745329f;
 		}
@@ -580,6 +636,7 @@ void rift_imu_read_end(float gyro_period_s)
 		if (!in_slice || cur.k != k0) {
 			if (in_slice && cur.k + 1 != k0) {
 				n_skipped++;
+				why_since |= WHY_SLICE_GAP;
 			}
 			if (in_slice) {
 				slice_close();
@@ -677,6 +734,17 @@ void rift_imu_command(int argc, char **argv)
 	queued_n = queued_max = 0;
 	queued_sum = 0;
 	k_msleep(5);
+	uint32_t few, rate, restarts;
+
+	rift_ts_fit_counts(&few, &rate, &restarts);
+	printk("IMU holes %u, last %u frames at %u ms, why %s%s%s%s, read gap %u ms\n", n_holes,
+	       hole_frames, hole_at_ms, hole_why & WHY_TIMING ? "timing " : "",
+	       hole_why & WHY_MODEL ? "model " : "", hole_why & WHY_ROOM ? "room " : "",
+	       hole_why & WHY_SLICE_GAP ? "slice-gap" : "", hole_gap_ms);
+	k_msleep(10);
+	printk("IMU untimed reads: timing %u, model %u; fits invalid: few %u, rate %u; restarts %u\n",
+	       n_untimed_timing, n_untimed_model, few, rate, restarts);
+	k_msleep(10);
 	printk("IMU since zero: %u slices composed ", comp);
 	print_f(q_angle_deg(qc), 2);
 	printk(" deg, fusion ");

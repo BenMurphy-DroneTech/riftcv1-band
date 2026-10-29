@@ -19,6 +19,15 @@
 #define RIFT_ACK_TIME 0xe0
 #define RIFT_ACK_LEN  10
 
+/* With a command pending, 17 bytes: then the command, the band (tracker id, or
+ * RIFT_CMD_ALL), the frame N it names (u32) and an argument (the channel, for a
+ * blink). rift_pulse carries them out. */
+#define RIFT_ACK_CMD_LEN   17
+#define RIFT_CMD_ROLL_CALL 1
+#define RIFT_CMD_BLINK     2
+#define RIFT_CMD_SLEEP_ALL 3
+#define RIFT_CMD_ALL       0xff
+
 /* The beacon clock against TIMER3: beacon = beacon_at + rate * (TIMER3 - band_at),
  * both clocks in 1/16 us. */
 struct rift_model {
@@ -38,6 +47,9 @@ void rift_ts_ack(const uint8_t *data, uint8_t length, uint32_t attempts);
 
 /* A copy of the current model. */
 void rift_ts_model(struct rift_model *m);
+
+/* Fits that gave no model (too few pairs, rate too far off), and restarts. */
+void rift_ts_fit_counts(uint32_t *few, uint32_t *rate, uint32_t *restarts);
 
 /* Ignore acknowledgements for ms milliseconds (the holdover test). */
 void rift_ts_hold(uint32_t ms);

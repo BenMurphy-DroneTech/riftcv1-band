@@ -570,6 +570,21 @@ static void power_thread(void)
 		bool abnormal_reading = battery_mV < 100 || battery_mV > 6000;
 		bool battery_available = battery_mV > 1500 && !abnormal_reading; // Keep working without the battery connected, otherwise it is obviously too dead to boot system
 		bool battery_discharged = battery_available && (average_pptt >= 0 ? average_pptt : battery_pptt) == 0;
+		// riftcv1-band: off below 3.4 V, on three readings in a row within 150 mV of each other. A
+		// battery pin with no battery floats and jumps by hundreds of mV (the test band on USB, whose
+		// VBUS detect reads false): counting those started a power-off that, on USB power, only
+		// half-ran and left the USB console dead
+		static int below_cutoff, cutoff_lo, cutoff_hi;
+		if (battery_available && battery_mV < 3400)
+		{
+			cutoff_lo = below_cutoff ? MIN(cutoff_lo, battery_mV) : battery_mV;
+			cutoff_hi = below_cutoff ? MAX(cutoff_hi, battery_mV) : battery_mV;
+			below_cutoff = cutoff_hi - cutoff_lo <= 150 ? below_cutoff + 1 : 0;
+		}
+		else
+			below_cutoff = 0;
+		if (below_cutoff >= 3)
+			battery_discharged = true;
 		// Separate detection of vin
 		if (!plugged && battery_mV > 4300 && !abnormal_reading)
 			plugged = true;

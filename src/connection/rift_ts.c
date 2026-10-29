@@ -27,13 +27,15 @@
 
 #include "rift_ts.h"
 #include "rift_pulse.h"
+#include "connection.h"
 
 #define PAIRS       64      /* kept                                              */
 #define FIT_PAIRS   32      /* fitted, the newest single-attempt pairs           */
 #define MODEL_PAIRS 8       /* fewer than this: no model to pulse from           */
 #define OUTLIER_NS  1000    /* dropped from the refit                            */
 #define GAP_MS      100000  /* a longer gap starts again (TIMER3 wraps in 268 s) */
-#define JUMP_US     1000    /* a pair this far off the model starts again too    */
+#define JUMP_US     1000    /* a pair this far off the model is bad, or a jump   */
+#define JUMP_PAIRS  3       /* single-attempt pairs in a row that far: a jump    */
 #define RATE_PPM    200     /* a fitted rate further off isn't a model           */
 
 struct pair {
@@ -51,6 +53,8 @@ struct fit {
 static struct pair pairs[PAIRS];
 static uint32_t n_pairs, n_retried, n_no_capture, n_held, n_outliers;
 static uint32_t n_restarts;   /* (never cleared, unlike the others) */
+static uint32_t n_fits_few, n_fits_rate;   /* fits too few pairs or too far off to be a model */
+static uint32_t n_far, n_far_run;          /* lone pairs dropped far off the model, and the run */
 static uint32_t period_us;
 static uint64_t band_hi;
 static uint32_t band_last;
@@ -123,8 +127,14 @@ uint32_t rift_ts_now(void)
 
 void rift_ts_ack(const uint8_t *data, uint8_t length, uint32_t attempts)
 {
-	if (length != RIFT_ACK_LEN || data[0] != RIFT_ACK_TIME) {
+	if (length < RIFT_ACK_LEN || data[0] != RIFT_ACK_TIME) {
 		return;
+	}
+	/* A command after the timestamp (only from a first attempt's acknowledgement:
+	 * a retry's can carry an old or reused payload) */
+	if (length == RIFT_ACK_CMD_LEN && attempts == 1 &&
+	    (data[11] == RIFT_CMD_ALL || data[11] == connection_get_id())) {
+		rift_pulse_band_command(data[10], sys_get_le32(&data[12]), data[16]);
 	}
 	if (NRF_PPI->CHEN & BIT(addr_ch)) {
 		n_no_capture++;   /* no transmit ADDRESS since the last TXREADY */
@@ -142,6 +152,13 @@ void rift_ts_ack(const uint8_t *data, uint8_t length, uint32_t attempts)
 		n_held++;
 		return;
 	}
+	if (attempts > 1) {
+		/* The receiver can answer a retried packet with an earlier acknowledgement's
+		 * payload: the same timestamp again, or a buffer since reused (a period and
+		 * time far off). Such a pair is no pair */
+		n_retried++;
+		return;
+	}
 
 	uint32_t frame = sys_get_le32(&data[1]);
 	uint32_t offset = sys_get_le24(&data[5]);
@@ -150,18 +167,29 @@ void rift_ts_ack(const uint8_t *data, uint8_t length, uint32_t attempts)
 	uint64_t band = band_hi | c;
 	const struct pair *prev = &pairs[(n_pairs + PAIRS - 1) % PAIRS];
 
-	/* Start again after a long gap, a new period, the beacon clock's wrap, or a
-	 * pair far off the model (the clock jumped, as rift_test.py's wrap test makes
-	 * it: a fit across the jump would give a nonsense rate) */
+	/* Start again after a long gap, a new period, the beacon clock's wrap, or
+	 * JUMP_PAIRS single-attempt pairs in a row far off the model (the clock
+	 * jumped, as rift_test.py's wrap test makes it: a fit across the jump would
+	 * give a nonsense rate). A lone pair far off is a bad timestamp (one the
+	 * receiver took from an earlier ADDRESS, say): dropped */
 	bool jumped = false;
 
-	if (model.valid) {
+	if (model.valid && attempts == 1) {
 		double predicted = model.beacon_at + model.rate * (double)(int32_t)(c - model.band_at);
 
-		jumped = fabs((double)beacon - predicted) > 16.0 * JUMP_US;
+		if (fabs((double)beacon - predicted) > 16.0 * JUMP_US) {
+			if (++n_far_run < JUMP_PAIRS) {
+				n_far++;
+				return;
+			}
+			jumped = true;
+		} else {
+			n_far_run = 0;
+		}
 	}
 	if (n_pairs && (now - last_ms > GAP_MS || period != period_us || beacon <= prev->beacon ||
 			jumped)) {
+		n_far_run = 0;
 		n_restarts++;
 		n_pairs = n_retried = n_no_capture = n_held = n_outliers = 0;
 		model.valid = false;
@@ -175,11 +203,7 @@ void rift_ts_ack(const uint8_t *data, uint8_t length, uint32_t attempts)
 	p->beacon = beacon;
 	p->attempts = attempts;
 	n_pairs++;
-	if (attempts > 1) {
-		n_retried++;
-	} else {
-		k_work_submit_to_queue(&fit_queue, &fit_work);
-	}
+	k_work_submit_to_queue(&fit_queue, &fit_work);
 }
 
 /* The newest single-attempt pairs, oldest first, into f; returns how many.
@@ -292,8 +316,17 @@ static void fit_model(struct k_work *work)
 	if (generation == n_restarts) {   /* not restarted meanwhile */
 		model = m;
 		n_outliers += dropped;
+		n_fits_few += l.n < MODEL_PAIRS;
+		n_fits_rate += fabs(l.b - 1.0) >= RATE_PPM * 1e-6;
 	}
 	irq_unlock(key);
+}
+
+void rift_ts_fit_counts(uint32_t *few, uint32_t *rate, uint32_t *restarts)
+{
+	*few = n_fits_few;
+	*rate = n_fits_rate;
+	*restarts = n_restarts;
 }
 
 void rift_ts_model(struct rift_model *m)
@@ -328,7 +361,8 @@ void rift_ts_print(void)
 	irq_unlock(key);
 
 	printk("PAIRS %u fitted of %u (%u retried, %u without a capture, %u outliers dropped; "
-	       "%u restarts)", n, total, retried, no_capture, n_outliers, n_restarts);
+	       "%u restarts, %u lone pairs far off dropped)", n, total, retried, no_capture, n_outliers,
+	       n_restarts, n_far);
 	if (n < 3) {
 		printk("\n");
 		return;

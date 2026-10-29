@@ -5,6 +5,8 @@
 #ifndef RIFT_PULSE_H
 #define RIFT_PULSE_H
 
+#include <stdint.h>
+
 /* From rift_ts_init, once TIMER3 runs. */
 void rift_pulse_init(void);
 
@@ -13,5 +15,12 @@ void rift_pulse_init(void);
  * and hold <ms>. Each answers with a PULSE status line (HOLD for hold). */
 void rift_pulse_command(int argc, char **argv);
 void rift_pulse_hold_command(int argc, char **argv);
+
+/* The markers console command: markers [<D10 id> <D9 id>], answering MARKERS. */
+void rift_pulse_markers_command(int argc, char **argv);
+
+/* From rift_ts: a command from the receiver's acknowledgement, for frame N
+ * (RIFT_CMD_* in rift_ts.h). */
+void rift_pulse_band_command(uint8_t type, uint32_t frame, uint8_t arg);
 
 #endif
