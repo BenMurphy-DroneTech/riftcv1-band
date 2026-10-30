@@ -44,7 +44,10 @@
 #define MODEL_PAIRS 8       /* fewer than this: no model to pulse from           */
 #define OUTLIER_NS  1000    /* dropped from the refit                            */
 #define GAP_MS      100000  /* a longer gap starts again (TIMER3 wraps in 268 s) */
-#define JUMP_US     1000    /* a pair this far off the model is bad, or a jump   */
+#define JUMP_US     20      /* a pair this far off the model is bad, or a jump:  */
+                    /* a good model predicts to about 0.1 us, and the     */
+                    /* receiver's stale timestamps (one seen 707 us off,  */
+                    /* an earlier packet's) skew a whole fit if kept      */
 #define JUMP_PAIRS  3       /* single-attempt pairs in a row that far: a jump    */
 #define RATE_PPM    200     /* a fitted rate further off isn't a model           */
 
