@@ -51,9 +51,18 @@ void rift_ts_model(struct rift_model *m);
 /* Fits that gave no model (too few pairs, rate too far off), and restarts. */
 void rift_ts_fit_counts(uint32_t *few, uint32_t *rate, uint32_t *restarts);
 
-/* Whether the crystal runs, how often it was found stopped, and the uptime
- * of the last time. */
-void rift_ts_xtal(bool *running, uint32_t *lost, int64_t *lost_ms);
+/* The crystal: whether it runs, how often it was found stopped and the uptime
+ * of the last time, this file's requests for it and the clock driver's count
+ * of requests (Smol Slime adds one around each packet). */
+struct rift_xtal {
+	bool running;
+	uint32_t lost;
+	int64_t lost_ms;
+	uint32_t requests;
+	uint32_t refs;
+};
+
+void rift_ts_xtal(struct rift_xtal *x);
 
 /* Ignore acknowledgements for ms milliseconds (the holdover test). */
 void rift_ts_hold(uint32_t ms);

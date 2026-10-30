@@ -276,15 +276,15 @@ static void print_status(void)
 	       m.last_ms ? age : -1, n_placed, n_late, n_dark,
 	       lead_min_us == INT32_MAX ? -1 : lead_min_us);
 
-	bool running;
-	uint32_t lost, few, rate, restarts;
-	int64_t lost_ms;
+	struct rift_xtal x;
+	uint32_t few, rate, restarts;
 
-	rift_ts_xtal(&running, &lost, &lost_ms);
+	rift_ts_xtal(&x);
 	rift_ts_fit_counts(&few, &rate, &restarts);
-	printk("  crystal %s, found stopped %u times", running ? "running" : "STOPPED", lost);
-	if (lost) {
-		printk(" (last %lld s ago)", (k_uptime_get() - lost_ms) / 1000);
+	printk("  crystal %s, requested %u times, driver count %u; found stopped %u times",
+	       x.running ? "running" : "STOPPED", x.requests, x.refs, x.lost);
+	if (x.lost) {
+		printk(" (last %lld s ago)", (k_uptime_get() - x.lost_ms) / 1000);
 	}
 	printk("; fits off by over 200 ppm %u, restarts %u\n", rate, restarts);
 }

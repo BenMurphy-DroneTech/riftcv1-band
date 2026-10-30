@@ -11,17 +11,20 @@
  * edge (rift_imu).
  *
  * TIMER3 only counts the crystal while HFCLK runs from it. Every
- * acknowledgement checks that it does; if not, the pairs start again and the
- * crystal is started directly (the clock driver still counts this file's
- * request, so a new request wouldn't), and pairs resume once it runs. The band
- * once stayed dark for hours with its fit at +1,406 ppm, TIMER3 on the
- * internal RC oscillator; what stopped the crystal isn't known.
+ * acknowledgement checks that it does; if not, the pairs start again, this
+ * file asks the clock driver for the crystal again and starts it directly, and
+ * pairs resume once it runs. The band has lost its hold on the crystal: the
+ * driver's count of requests fell to Smol Slime's per-packet one, so the
+ * crystal ran only around packets and TIMER3 on the internal RC oscillator
+ * between them (a fit at +1,406 ppm, dark for hours). Who released it isn't
+ * known; a request too many only keeps the crystal on.
  *
  * Every new single-attempt pair refits the model in a work item: a least-squares
  * line through the newest FIT_PAIRS of them, refitted once without any pair
  * more than OUTLIER_NS off the first line. The fit has its own work queue: the
  * system one's 256-byte stack is far too small for the double maths.
  */
+#include <errno.h>
 #include <math.h>
 #include <string.h>
 #include <zephyr/kernel.h>
@@ -78,17 +81,32 @@ static K_THREAD_STACK_DEFINE(fit_stack, 1536);
 static nrf_ppi_channel_t addr_ch, txready_ch;
 static nrf_ppi_channel_group_t addr_group;
 static struct onoff_client hfxo_client;
+static struct onoff_manager *hfxo_mgr;
+static uint32_t n_xtal_requests;
 
 static void fit_model(struct k_work *work);
+
+/* A request for the crystal that is never released (onoff is ISR-safe). The
+ * client is reused once the last request has completed. */
+static void hold_xtal(void)
+{
+	int res;
+
+	if (n_xtal_requests && sys_notify_fetch_result(&hfxo_client.notify, &res) == -EAGAIN) {
+		return;
+	}
+	sys_notify_init_spinwait(&hfxo_client.notify);
+	if (onoff_request(hfxo_mgr, &hfxo_client) >= 0) {
+		n_xtal_requests++;
+	}
+}
 
 static int rift_ts_init(void)
 {
 	/* The timer has to count the crystal, and ESB releases its own request
 	 * after every packet: hold one for good */
-	struct onoff_manager *mgr = z_nrf_clock_control_get_onoff(CLOCK_CONTROL_NRF_SUBSYS_HF);
-
-	sys_notify_init_spinwait(&hfxo_client.notify);
-	onoff_request(mgr, &hfxo_client);
+	hfxo_mgr = z_nrf_clock_control_get_onoff(CLOCK_CONTROL_NRF_SUBSYS_HF);
+	hold_xtal();
 
 	NRF_TIMER3->MODE = TIMER_MODE_MODE_Timer;
 	NRF_TIMER3->BITMODE = TIMER_BITMODE_BITMODE_32Bit;
@@ -177,6 +195,7 @@ void rift_ts_ack(const uint8_t *data, uint8_t length, uint32_t attempts)
 			n_pairs = n_retried = n_no_capture = n_held = n_outliers = 0;
 			model.valid = false;
 		}
+		hold_xtal();
 		NRF_CLOCK->TASKS_HFCLKSTART = 1;
 		return;
 	}
@@ -362,11 +381,13 @@ void rift_ts_fit_counts(uint32_t *few, uint32_t *rate, uint32_t *restarts)
 	*restarts = n_restarts;
 }
 
-void rift_ts_xtal(bool *running, uint32_t *lost, int64_t *lost_ms)
+void rift_ts_xtal(struct rift_xtal *x)
 {
-	*running = xtal_running();
-	*lost = n_xtal_lost;
-	*lost_ms = xtal_lost_ms;
+	x->running = xtal_running();
+	x->lost = n_xtal_lost;
+	x->lost_ms = xtal_lost_ms;
+	x->requests = n_xtal_requests;
+	x->refs = hfxo_mgr->refs;
 }
 
 void rift_ts_model(struct rift_model *m)
