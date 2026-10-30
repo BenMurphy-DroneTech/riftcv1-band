@@ -10,6 +10,13 @@
  * (for rift_pulse's interrupt and rift_ts_now) and CC5 the IMU's interrupt
  * edge (rift_imu).
  *
+ * TIMER3 only counts the crystal while HFCLK runs from it. Every
+ * acknowledgement checks that it does; if not, the pairs start again and the
+ * crystal is started directly (the clock driver still counts this file's
+ * request, so a new request wouldn't), and pairs resume once it runs. The band
+ * once stayed dark for hours with its fit at +1,406 ppm, TIMER3 on the
+ * internal RC oscillator; what stopped the crystal isn't known.
+ *
  * Every new single-attempt pair refits the model in a work item: a least-squares
  * line through the newest FIT_PAIRS of them, refitted once without any pair
  * more than OUTLIER_NS off the first line. The fit has its own work queue: the
@@ -55,6 +62,9 @@ static uint32_t n_pairs, n_retried, n_no_capture, n_held, n_outliers;
 static uint32_t n_restarts;   /* (never cleared, unlike the others) */
 static uint32_t n_fits_few, n_fits_rate;   /* fits too few pairs or too far off to be a model */
 static uint32_t n_far, n_far_run;          /* lone pairs dropped far off the model, and the run */
+static uint32_t n_xtal_lost;  /* crystal found stopped (never cleared)              */
+static int64_t xtal_lost_ms;  /* uptime it was last found stopped                   */
+static bool xtal_lost;        /* stopped at the last acknowledgement                */
 static uint32_t period_us;
 static uint64_t band_hi;
 static uint32_t band_last;
@@ -113,6 +123,13 @@ static int rift_ts_init(void)
 
 SYS_INIT(rift_ts_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
+static bool xtal_running(void)
+{
+	return (NRF_CLOCK->HFCLKSTAT & (CLOCK_HFCLKSTAT_SRC_Msk | CLOCK_HFCLKSTAT_STATE_Msk)) ==
+	       ((CLOCK_HFCLKSTAT_SRC_Xtal << CLOCK_HFCLKSTAT_SRC_Pos) |
+		(CLOCK_HFCLKSTAT_STATE_Running << CLOCK_HFCLKSTAT_STATE_Pos));
+}
+
 uint32_t rift_ts_now(void)
 {
 	unsigned int key = irq_lock();   /* (rift_pulse's interrupt captures CC4 too) */
@@ -148,6 +165,22 @@ void rift_ts_ack(const uint8_t *data, uint8_t length, uint32_t attempts)
 		band_hi += 1ull << 32;
 	}
 	band_last = c;
+	if (!xtal_running()) {
+		/* Pairs timed on the RC oscillator are no pairs: no model until the
+		 * crystal runs again */
+		if (!xtal_lost) {
+			xtal_lost = true;
+			n_xtal_lost++;
+			xtal_lost_ms = now;
+			n_far_run = 0;
+			n_restarts++;
+			n_pairs = n_retried = n_no_capture = n_held = n_outliers = 0;
+			model.valid = false;
+		}
+		NRF_CLOCK->TASKS_HFCLKSTART = 1;
+		return;
+	}
+	xtal_lost = false;
 	if (now < hold_until) {
 		n_held++;
 		return;
@@ -327,6 +360,13 @@ void rift_ts_fit_counts(uint32_t *few, uint32_t *rate, uint32_t *restarts)
 	*few = n_fits_few;
 	*rate = n_fits_rate;
 	*restarts = n_restarts;
+}
+
+void rift_ts_xtal(bool *running, uint32_t *lost, int64_t *lost_ms)
+{
+	*running = xtal_running();
+	*lost = n_xtal_lost;
+	*lost_ms = xtal_lost_ms;
 }
 
 void rift_ts_model(struct rift_model *m)

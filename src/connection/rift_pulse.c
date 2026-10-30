@@ -275,6 +275,18 @@ static void print_status(void)
 	       (uint32_t)(ppb_abs / 1000), (uint32_t)(ppb_abs % 1000), m.rms_ns,
 	       m.last_ms ? age : -1, n_placed, n_late, n_dark,
 	       lead_min_us == INT32_MAX ? -1 : lead_min_us);
+
+	bool running;
+	uint32_t lost, few, rate, restarts;
+	int64_t lost_ms;
+
+	rift_ts_xtal(&running, &lost, &lost_ms);
+	rift_ts_fit_counts(&few, &rate, &restarts);
+	printk("  crystal %s, found stopped %u times", running ? "running" : "STOPPED", lost);
+	if (lost) {
+		printk(" (last %lld s ago)", (k_uptime_get() - lost_ms) / 1000);
+	}
+	printk("; fits off by over 200 ppm %u, restarts %u\n", rate, restarts);
 }
 
 /* A number of microseconds, maybe with a fraction, as nanoseconds */

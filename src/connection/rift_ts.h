@@ -51,6 +51,10 @@ void rift_ts_model(struct rift_model *m);
 /* Fits that gave no model (too few pairs, rate too far off), and restarts. */
 void rift_ts_fit_counts(uint32_t *few, uint32_t *rate, uint32_t *restarts);
 
+/* Whether the crystal runs, how often it was found stopped, and the uptime
+ * of the last time. */
+void rift_ts_xtal(bool *running, uint32_t *lost, int64_t *lost_ms);
+
 /* Ignore acknowledgements for ms milliseconds (the holdover test). */
 void rift_ts_hold(uint32_t ms);
 
