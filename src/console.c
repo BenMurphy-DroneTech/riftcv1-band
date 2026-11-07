@@ -496,10 +496,10 @@ static void print_help(void)
 	printk("battery                      Get battery information\n");
 	printk("stats                        Get radio packet counts since the last stats\n");
 	printk("pairs                        Timestamp pairs from the receiver and their line fit\n");
-	printk("pulse [on|off|width|at|trim] The frame-boundary LED pulse on D10 and D9\n");
+	printk("pulse [on|off|width|at|trim] The frame-boundary LED pulse on D5-D8 (width up to 215 us)\n");
 	printk("hold <ms>                    Ignore the receiver's timestamps (holdover test)\n");
 	printk("imu [zero]                   IMU sample timing and half-frame slices\n");
-	printk("markers [<D10 id> <D9 id>]   Marker IDs for the roll call (1-30)\n");
+	printk("markers [<D5..D8 ids>]       Marker IDs for the roll call (1-30), one per pin\n");
 	printk("airtime [b <n> [<ms>]]       Radio time per packet; b sends n test packets B\n");
 	printk("\nscan                         Restart sensor scan\n");
 	printk("calibrate                    Calibrate sensor ZRO\n");

@@ -15,6 +15,7 @@
 #include <zephyr/pm/device.h>
 
 #include "power.h"
+#include "connection/rift_pulse.h"
 
 #define DFU_DBL_RESET_MEM 0x20007F7C
 #define DFU_DBL_RESET_APP 0x4ee5677e
@@ -338,6 +339,7 @@ static void sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 static void sys_system_off(bool silent) // TODO: add timeout
 {
 	LOG_INF("System off requested");
+	rift_pulse_stop(); // riftcv1-band: the LED pins low before System OFF keeps their level
 	configure_system_off(); // Common subsystem shutdown and prepare sense pins
 	int64_t start_time = k_uptime_get();
 	if (!silent) // indicate shutdown is happening

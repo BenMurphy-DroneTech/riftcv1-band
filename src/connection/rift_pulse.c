@@ -1,11 +1,18 @@
 /*
  * rift_pulse: the LED pulse on every camera frame boundary, placed in hardware
- * from the clock model (rift_ts), on the test band's D10 (P1.15) and D9 (P1.14).
+ * from the clock model (rift_ts), on four pins: the breadboard wand's L293D
+ * inputs 1A-4A, from D5 (P0.05), D6 (P1.11), D7 (P1.12) and D8 (P1.13).
+ *
+ * No pin is ever high for more than WIDTH_MAX_US (215 us), in any case: the
+ * wand has no hardware limit on its LED current's duration. The width command
+ * stops at it, the pulse is switched off in hardware, power-off clears the pins
+ * first (System OFF keeps a pin's level), and a reset or fault returns them to
+ * inputs, held low by the board's pull-downs.
  *
  * TIMER3 (rift_ts's 16 MHz timer) compares:
  *   CC1  LED on:  a PPI channel per pin to its GPIOTE SET, each enabled only
  *        for a frame its channel is lit in
- *   CC2  LED off: PPI to GPIOTE CLR on both
+ *   CC2  LED off: two PPI channels, each with its fork, to GPIOTE CLR on all four
  *   CC3  wake-up interrupt WAKE_US before the next pulse: it converts that
  *        frame's boundary to TIMER3 ticks from the model, loads CC1 and CC2,
  *        and sets CC3 for the frame after
@@ -42,31 +49,42 @@
 #define MIN_LEAD_US  50     /* less than this to the pulse: skip it    */
 #define HOLDOVER_MS  500    /* pulse on the last model this long       */
 #define WIDTH_US     215
+#define WIDTH_MAX_US 215    /* never longer: see the top                */
 /* The fixed delays, from rift_test.py sweep edges --band against the beacon's
  * own flash: the band pulsed 5.3 us early (the receiver's RX ADDRESS event
  * comes later after the packet's start than the band's TX ADDRESS, plus the
  * test band's driver) */
 #define TRIM_NS      5300
 
-static const uint32_t pins[] = {15, 14};   /* P1.15 = D10, P1.14 = D9 */
+static const struct {
+	uint8_t port, pin;
+} pins[] = {
+	{0, 5},    /* D5 = P0.05 -> 1A */
+	{1, 11},   /* D6 = P1.11 -> 2A */
+	{1, 12},   /* D7 = P1.12 -> 3A */
+	{1, 13},   /* D8 = P1.13 -> 4A */
+};
+#define N_PINS ARRAY_SIZE(pins)
 
 static bool enabled = true;
 static uint32_t width_us = WIDTH_US;
 static int32_t at_ns, trim_ns = TRIM_NS;
 static uint32_t holdover_ms = HOLDOVER_MS;
 
-static nrf_ppi_channel_t on_ch[ARRAY_SIZE(pins)], off_ch;
-static uint8_t gpiote_ch[ARRAY_SIZE(pins)];
+static nrf_ppi_channel_t on_ch[N_PINS], off_ch[N_PINS / 2];
+static uint8_t gpiote_ch[N_PINS];
+static uint32_t ppi_mask;               /* every channel above */
 static bool ready, pulsing;
+static volatile bool stopped;           /* for power-off: dark for good */
 static uint32_t n_placed, n_late, n_dark;
 static int32_t lead_min_us = INT32_MAX;
 
 /* Commands and marker IDs (see the top) */
-static uint8_t marker_id[ARRAY_SIZE(pins)] = {1, 2};   /* MARKER_IDS */
+static uint8_t marker_id[N_PINS] = {1, 2, 3, 4};   /* MARKER_IDS */
 static volatile bool roll_live, blink_live, sleep_live;
 static volatile uint32_t roll_frame, blink_frame, sleep_frame;
 static volatile uint8_t blink_ch;
-static uint32_t n_cmds, n_dark_pulses[ARRAY_SIZE(pins)];
+static uint32_t n_cmds, n_dark_pulses[N_PINS];
 
 static void sleep_now(struct k_work *work)
 {
@@ -126,8 +144,8 @@ static inline uint32_t now_isr(void)
 
 static void dark(void)
 {
-	NRF_PPI->CHENCLR = BIT(on_ch[0]) | BIT(on_ch[1]) | BIT(off_ch);
-	for (int i = 0; i < ARRAY_SIZE(pins); i++) {
+	NRF_PPI->CHENCLR = ppi_mask;
+	for (int i = 0; i < N_PINS; i++) {
 		NRF_GPIOTE->TASKS_CLR[gpiote_ch[i]] = 1;
 	}
 	pulsing = false;
@@ -142,7 +160,7 @@ static void timer3_isr(const void *arg)
 	uint32_t now = now_isr();
 
 	rift_ts_model(&m);
-	if (!enabled || !m.valid || k_uptime_get() - m.last_ms > holdover_ms) {
+	if (stopped || !enabled || !m.valid || k_uptime_get() - m.last_ms > holdover_ms) {
 		dark();
 		n_dark++;
 		NRF_TIMER3->CC[3] = now + 16 * (m.period_us ? m.period_us : 11111);
@@ -175,7 +193,7 @@ static void timer3_isr(const void *arg)
 
 		NRF_TIMER3->CC[1] = on;
 		NRF_TIMER3->CC[2] = off;
-		for (int i = 0; i < ARRAY_SIZE(pins); i++) {
+		for (int i = 0; i < N_PINS; i++) {
 			if (mask & BIT(i)) {
 				NRF_PPI->CHENCLR = BIT(on_ch[i]);
 				n_dark_pulses[i]++;
@@ -184,7 +202,7 @@ static void timer3_isr(const void *arg)
 			}
 		}
 		if (!pulsing) {
-			NRF_PPI->CHENSET = BIT(off_ch);
+			NRF_PPI->CHENSET = BIT(off_ch[0]) | BIT(off_ch[1]);
 			pulsing = true;
 		}
 		n_placed++;
@@ -205,40 +223,47 @@ void rift_pulse_init(void)
 {
 	static const nrfx_gpiote_t gpiote = NRFX_GPIOTE_INSTANCE(0);
 
-	for (int i = 0; i < ARRAY_SIZE(pins); i++) {
-		if (nrfx_gpiote_channel_alloc(&gpiote, &gpiote_ch[i]) != NRFX_SUCCESS) {
-			printk("rift_pulse: no GPIOTE channel\n");
+	for (int i = 0; i < N_PINS; i++) {
+		if (nrfx_gpiote_channel_alloc(&gpiote, &gpiote_ch[i]) != NRFX_SUCCESS ||
+		    nrfx_ppi_channel_alloc(&on_ch[i]) != NRFX_SUCCESS) {
+			printk("rift_pulse: no GPIOTE or PPI channel\n");
 			return;
 		}
+		ppi_mask |= BIT(on_ch[i]);
 	}
-	if (nrfx_ppi_channel_alloc(&on_ch[0]) != NRFX_SUCCESS ||
-	    nrfx_ppi_channel_alloc(&on_ch[1]) != NRFX_SUCCESS ||
-	    nrfx_ppi_channel_alloc(&off_ch) != NRFX_SUCCESS) {
-		printk("rift_pulse: no PPI channels\n");
-		return;
+	for (int j = 0; j < N_PINS / 2; j++) {
+		if (nrfx_ppi_channel_alloc(&off_ch[j]) != NRFX_SUCCESS) {
+			printk("rift_pulse: no PPI channel\n");
+			return;
+		}
+		ppi_mask |= BIT(off_ch[j]);
 	}
-	for (int i = 0; i < ARRAY_SIZE(pins); i++) {
+	for (int i = 0; i < N_PINS; i++) {
 		/* High-drive output, then hand the pin to a GPIOTE task channel */
-		NRF_P1->OUTCLR = BIT(pins[i]);
-		NRF_P1->PIN_CNF[pins[i]] =
+		NRF_GPIO_Type *port = pins[i].port ? NRF_P1 : NRF_P0;
+
+		port->OUTCLR = BIT(pins[i].pin);
+		port->PIN_CNF[pins[i].pin] =
 			(GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
 			(GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
 			(GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos) |
 			(GPIO_PIN_CNF_DRIVE_H0H1 << GPIO_PIN_CNF_DRIVE_Pos);
 		NRF_GPIOTE->CONFIG[gpiote_ch[i]] =
 			(GPIOTE_CONFIG_MODE_Task << GPIOTE_CONFIG_MODE_Pos) |
-			(pins[i] << GPIOTE_CONFIG_PSEL_Pos) |
-			(1 << GPIOTE_CONFIG_PORT_Pos) |
+			(pins[i].pin << GPIOTE_CONFIG_PSEL_Pos) |
+			(pins[i].port << GPIOTE_CONFIG_PORT_Pos) |
 			(GPIOTE_CONFIG_POLARITY_Toggle << GPIOTE_CONFIG_POLARITY_Pos) |
 			(GPIOTE_CONFIG_OUTINIT_Low << GPIOTE_CONFIG_OUTINIT_Pos);
 	}
-	for (int i = 0; i < ARRAY_SIZE(pins); i++) {
+	for (int i = 0; i < N_PINS; i++) {
 		NRF_PPI->CH[on_ch[i]].EEP = (uint32_t)&NRF_TIMER3->EVENTS_COMPARE[1];
 		NRF_PPI->CH[on_ch[i]].TEP = (uint32_t)&NRF_GPIOTE->TASKS_SET[gpiote_ch[i]];
 	}
-	NRF_PPI->CH[off_ch].EEP = (uint32_t)&NRF_TIMER3->EVENTS_COMPARE[2];
-	NRF_PPI->CH[off_ch].TEP = (uint32_t)&NRF_GPIOTE->TASKS_CLR[gpiote_ch[0]];
-	NRF_PPI->FORK[off_ch].TEP = (uint32_t)&NRF_GPIOTE->TASKS_CLR[gpiote_ch[1]];
+	for (int j = 0; j < N_PINS / 2; j++) {
+		NRF_PPI->CH[off_ch[j]].EEP = (uint32_t)&NRF_TIMER3->EVENTS_COMPARE[2];
+		NRF_PPI->CH[off_ch[j]].TEP = (uint32_t)&NRF_GPIOTE->TASKS_CLR[gpiote_ch[2 * j]];
+		NRF_PPI->FORK[off_ch[j]].TEP = (uint32_t)&NRF_GPIOTE->TASKS_CLR[gpiote_ch[2 * j + 1]];
+	}
 
 	IRQ_CONNECT(TIMER3_IRQn, 1, timer3_isr, NULL, 0);
 	NRF_TIMER3->CC[3] = now_isr() + 16 * 10000;
@@ -246,6 +271,14 @@ void rift_pulse_init(void)
 	NRF_TIMER3->INTENSET = TIMER_INTENSET_COMPARE3_Msk;
 	irq_enable(TIMER3_IRQn);
 	ready = true;
+}
+
+void rift_pulse_stop(void)
+{
+	stopped = true;   /* (an interrupt from here on goes dark too) */
+	if (ready) {
+		dark();
+	}
 }
 
 static void print_ns(const char *label, int32_t v)
@@ -314,7 +347,7 @@ void rift_pulse_command(int argc, char **argv)
 		enabled = true;
 	} else if (argc == 2 && !strcmp(argv[1], "off")) {
 		enabled = false;
-	} else if (argc == 3 && !strcmp(argv[1], "width") && parse_us(argv[2], 1, 2000, &v)) {
+	} else if (argc == 3 && !strcmp(argv[1], "width") && parse_us(argv[2], 1, WIDTH_MAX_US, &v)) {
 		width_us = (v + 500) / 1000;
 	} else if (argc == 3 && !strcmp(argv[1], "at") && parse_us(argv[2], -20000, 20000, &v)) {
 		at_ns = v;
@@ -326,7 +359,8 @@ void rift_pulse_command(int argc, char **argv)
 		n_placed = n_late = n_dark = 0;
 		lead_min_us = INT32_MAX;
 	} else if (argc != 1) {
-		printk("pulse [on|off | width <us> | at <us> | trim <us> | holdover <ms> | reset]\n");
+		printk("pulse [on|off | width <us, up to %u> | at <us> | trim <us> | holdover <ms> | reset]\n",
+		       WIDTH_MAX_US);
 		return;
 	}
 	print_status();
@@ -334,21 +368,26 @@ void rift_pulse_command(int argc, char **argv)
 
 void rift_pulse_markers_command(int argc, char **argv)
 {
-	if (argc == 3) {
-		long a = strtol(argv[1], NULL, 10), b = strtol(argv[2], NULL, 10);
+	if (argc == 1 + N_PINS) {
+		long id[N_PINS];
 
-		if (a < 1 || a > 30 || b < 1 || b > 30) {
-			printk("markers <D10 id> <D9 id>: 1 to 30\n");
-			return;
+		for (int i = 0; i < N_PINS; i++) {
+			id[i] = strtol(argv[1 + i], NULL, 10);
+			if (id[i] < 1 || id[i] > 30) {
+				printk("markers <D5 id> <D6 id> <D7 id> <D8 id>: 1 to 30\n");
+				return;
+			}
 		}
-		marker_id[0] = a;
-		marker_id[1] = b;
+		for (int i = 0; i < N_PINS; i++) {
+			marker_id[i] = id[i];
+		}
 	} else if (argc != 1) {
-		printk("markers [<D10 id> <D9 id>]\n");
+		printk("markers [<D5 id> <D6 id> <D7 id> <D8 id>]\n");
 		return;
 	}
-	printk("MARKERS %u %u; %u commands taken; dark pulses %u %u\n", marker_id[0], marker_id[1],
-	       n_cmds, n_dark_pulses[0], n_dark_pulses[1]);
+	printk("MARKERS %u %u %u %u; %u commands taken; dark pulses %u %u %u %u\n",
+	       marker_id[0], marker_id[1], marker_id[2], marker_id[3], n_cmds,
+	       n_dark_pulses[0], n_dark_pulses[1], n_dark_pulses[2], n_dark_pulses[3]);
 }
 
 void rift_pulse_hold_command(int argc, char **argv)
